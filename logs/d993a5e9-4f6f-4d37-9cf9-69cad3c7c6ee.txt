@@ -1,0 +1,1577 @@
+====================================================================================================
+# NOTE: record from https://github.com/KellerJordan/modded-nanogpt/blob/master/records/track_1_short/2024-10-14_ModernArch/dabaaddd-237c-4ec9-939d-6608a9ed5e27.txt
+# ====================================================================================================
+import os
+import sys
+with open(sys.argv[0]) as f:
+    code = f.read() # read the code of this file ASAP, for logging
+import uuid
+import glob
+import time
+import json
+import dataclasses
+import subprocess
+import csv
+from dataclasses import dataclass
+
+import numpy as np
+import torch
+from torch import nn
+import torch.nn.functional as F
+import torch.distributed as dist
+import torch._inductor.config as config
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+# -----------------------------------------------------------------------------
+# Muon optimizer
+
+def zeropower_via_svd(G, steps=None):
+    U, S, V = G.svd()
+    return U @ V.T
+
+@torch.compile
+def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
+    """
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
+    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
+    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
+    zero even beyond the point where the iteration no longer converges all the way to one everywhere
+    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
+    where S' is diagonal with S_{ii}' \\sim Uniform(0.5, 1.5), which turns out not to hurt model
+    performance at all relative to UV^T, where USV^T = G is the SVD.
+    """
+    assert len(G.shape) == 2
+    a, b, c = (3.4445, -4.7750,  2.0315)
+    X = G.bfloat16()
+    X /= (X.norm() + eps) # ensure top singular value <= 1
+    if G.size(0) > G.size(1):
+        X = X.T
+    for _ in range(steps):
+        A = X @ X.T
+        B = A @ X
+        X = a * X + b * B + c * A @ B
+    if G.size(0) > G.size(1):
+        X = X.T
+    return X
+
+zeropower_backends = dict(svd=zeropower_via_svd, newtonschulz5=zeropower_via_newtonschulz5)
+
+class Muon(torch.optim.Optimizer):
+    """
+    Muon - MomentUm Orthogonalized by Newton-schulz
+
+    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
+    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
+    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
+    the advantage that it can be stably run in bfloat16 on the GPU.
+
+    Some warnings:
+    - This optimizer assumes that all parameters passed in are 2D.
+    - It should not be used for the embedding layer, the final fully connected layer, or any {0,1}-D
+    parameters; those should all be optimized by a standard method (e.g., AdamW).
+    - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
+    - We believe it is unlikely to work well for training with small batch size.
+    - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
+    - We have not yet tried this optimizer for training scenarios larger than NanoGPT (124M).
+
+    Arguments:
+        lr: The learning rate used by the internal SGD.
+        momentum: The momentum used by the internal SGD.
+        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
+        backend: The chosen backend for the orthogonalization step. (recommended: 'newtonschulz5')
+        backend_steps: The number of iteration steps to use in the backend, if it is iterative.
+    """
+    def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True, backend='newtonschulz5', backend_steps=5):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
+        super().__init__(params, defaults)
+
+    def step(self):
+        for group in self.param_groups:
+            lr = group['lr']
+            momentum = group['momentum']
+            zeropower_backend = zeropower_backends[group['backend']]
+            for p in group['params']:
+                g = p.grad
+                if g is None:
+                    continue
+                state = self.state[p]
+                if 'momentum_buffer' not in state:
+                    state['momentum_buffer'] = torch.zeros_like(g)
+                buf = state['momentum_buffer']
+                buf.mul_(momentum).add_(g)
+                if group['nesterov']:
+                    g = g.add(buf, alpha=momentum)
+                if g.size(0) == 3 * g.size(1): # split grouped QKV parameters
+                    g = torch.cat([zeropower_backend(g1, steps=group['backend_steps']) for g1 in g.split(g.size(1))])
+                    scale = g.size(1)**0.5
+                else:
+                    g = zeropower_backend(g, steps=group['backend_steps'])
+                    scale = max(g.size(0), g.size(1))**0.5 # scale to have update.square().mean() == 1
+                p.data.add_(g, alpha=-lr * scale)
+
+# -----------------------------------------------------------------------------
+# PyTorch nn.Module definitions for the GPT-2 model
+
+class Rotary(torch.nn.Module):
+
+    def __init__(self, dim, base=10000):
+        super().__init__()
+        self.inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.seq_len_cached = None
+        self.cos_cached = None
+        self.sin_cached = None
+
+    def forward(self, x):
+        seq_len = x.shape[1]
+        if seq_len != self.seq_len_cached:
+            self.seq_len_cached = seq_len
+            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
+            freqs = torch.outer(t, self.inv_freq).to(x.device)
+            self.cos_cached = freqs.cos().bfloat16()
+            self.sin_cached = freqs.sin().bfloat16()
+        return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
+
+def apply_rotary_emb(x, cos, sin):
+    assert x.ndim == 4 # multihead attention
+    d = x.shape[3]//2
+    x1 = x[..., :d]
+    x2 = x[..., d:]
+    y1 = x1 * cos + x2 * sin
+    y2 = x1 * (-sin) + x2 * cos
+    return torch.cat([y1, y2], 3).type_as(x)
+
+def _apply_gate_act(logits: torch.Tensor, kind: str) -> torch.Tensor:
+    if kind == "sigmoid":
+        return torch.sigmoid(logits)
+    if kind == "ns_sigmoid":
+        return 0.5 + 0.5 * torch.sigmoid(logits)
+    raise ValueError(f"unknown gate_act={kind}")
+
+class CausalSelfAttention(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.head_dim = self.n_embd // self.n_head
+        assert self.n_embd % self.n_head == 0
+        self.attn_gate = getattr(config, "attn_gate", "none")
+        self.gate_pos = getattr(config, "gate_pos", "sdpa")
+        self.gate_act = getattr(config, "gate_act", "sigmoid")
+        self.c_q = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_k = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_v = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        # output projection
+        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+        self.rotary = Rotary(self.head_dim)
+        if self.attn_gate == "headwise":
+            self.c_gate = nn.Linear(self.n_embd, self.n_head, bias=False)
+            self.gate_param = None
+        elif self.attn_gate == "elementwise":
+            self.c_gate = nn.Linear(self.n_embd, self.n_embd, bias=False)
+            self.gate_param = None
+        elif self.attn_gate == "const":
+            self.c_gate = None
+            self.gate_param = nn.Parameter(torch.zeros(self.n_head, self.head_dim))
+        else:
+            self.c_gate = None
+            self.gate_param = None
+
+    def forward(self, x):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+        k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
+        if self.attn_gate != "none" and self.gate_pos == "value":
+            if self.attn_gate == "const":
+                gate = _apply_gate_act(self.gate_param, self.gate_act)[None, None, :, :]
+            else:
+                gate_logits = self.c_gate(x)
+                gate = _apply_gate_act(gate_logits, self.gate_act)
+                if self.attn_gate == "headwise":
+                    gate = gate.view(B, T, self.n_head, 1)
+                else:
+                    gate = gate.view(B, T, self.n_head, self.head_dim)
+            v = v * gate
+        cos, sin = self.rotary(q)
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
+        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
+        y = y.transpose(1, 2) # (B, T, n_head, head_dim)
+        if self.attn_gate != "none" and self.gate_pos == "sdpa":
+            if self.attn_gate == "const":
+                gate = _apply_gate_act(self.gate_param, self.gate_act)[None, None, :, :]
+            else:
+                gate_logits = self.c_gate(x)
+                gate = _apply_gate_act(gate_logits, self.gate_act)
+                if self.attn_gate == "headwise":
+                    gate = gate.view(B, T, self.n_head, 1)
+                else:
+                    gate = gate.view(B, T, self.n_head, self.head_dim)
+            y = y * gate
+        y = y.contiguous().view_as(x) # re-assemble all head outputs side by side
+        y = self.c_proj(y)
+        return y
+
+class MLP(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+        x = self.c_proj(x)
+        return x
+
+class Block(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.attn = CausalSelfAttention(config)
+        self.mlp = MLP(config)
+
+    def forward(self, x):
+        x = x + self.attn(F.rms_norm(x, (x.size(-1),)))
+        x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
+        return x
+
+# -----------------------------------------------------------------------------
+# The main GPT-2 model
+
+@dataclass
+class GPTConfig:
+    vocab_size : int = 50304
+    n_layer : int = 12
+    n_head : int = 6 # head dim 128 suggested by @Grad62304977
+    n_embd : int = 768
+    attn_gate : str = "none"
+    gate_pos : str = "sdpa"
+    gate_act : str = "sigmoid"
+
+class GPT(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+        ))
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+
+    def forward(self, idx, targets=None, return_logits=True):
+
+        # forward the GPT model itself
+        x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        for block in self.transformer.h:
+            x = block(x)
+        x = F.rms_norm(x, (x.size(-1),))
+
+        if targets is not None:
+            # if we are given some desired targets also calculate the loss
+            logits = self.lm_head(x)
+            logits = logits.float() # use tf32/fp32 for logits
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        else:
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = logits.float() # use tf32/fp32 for logits
+            loss = None
+
+        # there are performance reasons why not returning logits is prudent, if not needed
+        if not return_logits:
+            logits = None
+
+        return logits, loss
+
+# -----------------------------------------------------------------------------
+# Our own simple Distributed Data Loader
+
+def _peek_data_shard(filename):
+    # only reads the header, returns header data
+    with open(filename, "rb") as f:
+        # first read the header, which is 256 int32 integers (4 bytes each)
+        header = np.frombuffer(f.read(256*4), dtype=np.int32)
+    if header[0] != 20240520:
+        print("ERROR: magic number mismatch in the data .bin file!")
+        print("---> HINT: Are you passing in a correct file with --input_bin?")
+        print("---> HINT: Dataset encoding changed recently, re-run data prepro or refer again to README")
+        print("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
+        exit(1)
+    assert header[1] == 1, "unsupported version"
+    ntok = header[2] # number of tokens (claimed)
+    return ntok # for now just return the number of tokens
+
+def _load_data_shard(filename):
+    with open(filename, "rb") as f:
+        # first read the header, which is 256 int32 integers (4 bytes each)
+        header = np.frombuffer(f.read(256*4), dtype=np.int32)
+        assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+        assert header[1] == 1, "unsupported version"
+        ntok = header[2] # number of tokens (claimed)
+        # the rest of it are tokens, stored as uint16
+        tokens = np.frombuffer(f.read(), dtype=np.uint16)
+    assert len(tokens) == ntok, "number of tokens read does not match header?"
+    return tokens
+
+class DistributedDataLoader:
+    def __init__(self, filename_pattern, B, T, process_rank, num_processes):
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        self.B = B
+        self.T = T
+
+        # glob files that match the pattern
+        self.files = sorted(glob.glob(filename_pattern))
+        assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
+
+        # load and validate all data shards, count number of tokens in total
+        ntok_total = 0
+        for fname in self.files:
+            shard_ntok = _peek_data_shard(fname)
+            assert shard_ntok >= num_processes * B * T + 1
+            ntok_total += int(shard_ntok)
+        self.ntok_total = ntok_total
+
+        # kick things off
+        self.reset()
+
+    def reset(self):
+        self.current_shard = 0
+        self.current_position = self.process_rank * self.B * self.T
+        self.tokens = _load_data_shard(self.files[self.current_shard])
+
+    def advance(self): # advance to next data shard
+        self.current_shard = (self.current_shard + 1) % len(self.files)
+        self.current_position = self.process_rank * self.B * self.T
+        self.tokens = _load_data_shard(self.files[self.current_shard])
+
+    def next_batch(self):
+        B = self.B
+        T = self.T
+        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
+        x = (buf[:-1]).view(B, T) # inputs
+        y = (buf[1:]).view(B, T) # targets
+        # advance current position and load next shard if necessary
+        self.current_position += B * T * self.num_processes
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.advance()
+        return x.cuda(), y.cuda()
+
+# -----------------------------------------------------------------------------
+# int main
+
+@dataclass
+class Hyperparameters:
+    # data hyperparams
+    input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
+    input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
+    # optimization hyperparams
+    batch_size : int = 8*64 # batch size, in sequences, across all devices
+    device_batch_size : int = 64 # batch size, in sequences, per device
+    sequence_length : int = 1024 # sequence length, in tokens
+    num_iterations : int = 5100 # number of iterations to run
+    learning_rate : float = 0.0036
+    warmup_iters : int = 0
+    warmdown_iters : int = 1450 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
+    weight_decay : float = 0
+    seed : int = 1337
+    attn_gate : str = "none" # none|headwise|elementwise|const
+    gate_pos : str = "sdpa" # sdpa|value
+    gate_act : str = "sigmoid" # sigmoid|ns_sigmoid
+    early_stop_patience : int = 0 # 0 disables early stopping
+    early_stop_min_delta : float = 0.0
+    # evaluation and logging hyperparams
+    val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
+args = Hyperparameters()
+
+def apply_env_overrides():
+    # environment-variable overrides allow quick sweeps without editing code
+    args.learning_rate = float(os.environ.get("LR", args.learning_rate))
+    args.seed = int(os.environ.get("SEED", args.seed))
+    args.warmup_iters = int(os.environ.get("WARMUP_ITERS", args.warmup_iters))
+    args.num_iterations = int(os.environ.get("NUM_ITERATIONS", args.num_iterations))
+    args.early_stop_patience = int(os.environ.get("EARLY_STOP_PATIENCE", args.early_stop_patience))
+    args.early_stop_min_delta = float(os.environ.get("EARLY_STOP_MIN_DELTA", args.early_stop_min_delta))
+    args.attn_gate = os.environ.get("ATTNGATE", args.attn_gate)
+    args.gate_pos = os.environ.get("GATEPOS", args.gate_pos)
+    args.gate_act = os.environ.get("GATEACT", args.gate_act)
+    args.num_iterations = int(os.environ.get("NUM_ITER", args.num_iterations))
+    args.val_loss_every = int(os.environ.get("VAL_EVERY", args.val_loss_every))
+
+def get_git_commit():
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    except Exception:
+        return "unknown"
+
+apply_env_overrides()
+torch.manual_seed(args.seed)
+torch.cuda.manual_seed_all(args.seed)
+np.random.seed(args.seed)
+
+# set up DDP (distributed data parallel). torchrun sets this env variable
+assert torch.cuda.is_available()
+dist.init_process_group(backend='nccl')
+ddp_rank = int(os.environ['RANK'])
+ddp_local_rank = int(os.environ['LOCAL_RANK'])
+ddp_world_size = int(os.environ['WORLD_SIZE'])
+device = f'cuda:{ddp_local_rank}'
+torch.cuda.set_device(device)
+print(f"using device: {device}")
+master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
+git_commit = get_git_commit() if master_process else "unknown"
+
+# convenience variables
+B, T = args.device_batch_size, args.sequence_length
+# calculate the number of steps to take in the val loop.
+assert args.val_tokens % (B * T * ddp_world_size) == 0
+val_steps = args.val_tokens // (B * T * ddp_world_size)
+# calculate the steps of gradient accumulation required to attain the desired global batch size.
+assert args.batch_size % (B * ddp_world_size) == 0
+train_accumulation_steps = args.batch_size // (B * ddp_world_size)
+
+# load tokens
+train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
+val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+if master_process:
+    print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
+    print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
+x, y = train_loader.next_batch()
+
+# there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
+# this originates from Karpathy's experiments.
+num_vocab = 50304
+model = GPT(GPTConfig(
+    vocab_size=num_vocab,
+    n_layer=12,
+    n_head=6,
+    n_embd=768,
+    attn_gate=args.attn_gate,
+    gate_pos=args.gate_pos,
+    gate_act=args.gate_act,
+))
+model = model.cuda()
+if hasattr(config, "coordinate_descent_tuning"):
+    config.coordinate_descent_tuning = True # suggested by @Chillee
+model = torch.compile(model)
+# here we wrap model into DDP container
+model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module # always contains the "raw" unwrapped model
+ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
+
+# init the optimizer(s)
+optimizer1 = torch.optim.AdamW(raw_model.lm_head.parameters(), lr=args.learning_rate, betas=(0.9, 0.95),
+                               weight_decay=args.weight_decay, fused=True)
+optimizer2 = Muon(raw_model.transformer.h.parameters(), lr=0.1*args.learning_rate, momentum=0.95)
+optimizers = [optimizer1, optimizer2]
+# learning rate decay scheduler (linear warmup and warmdown)
+def get_lr(it):
+    assert it <= args.num_iterations
+    # 1) linear warmup for warmup_iters steps
+    if it < args.warmup_iters:
+        return (it+1) / args.warmup_iters
+    # 2) constant lr for a while
+    elif it < args.num_iterations - args.warmdown_iters:
+        return 1.0
+    # 3) linear warmdown
+    else:
+        decay_ratio = (args.num_iterations - it) / args.warmdown_iters
+        return decay_ratio
+schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
+
+# begin logging
+if master_process:
+    run_id = str(uuid.uuid4())
+    logdir = 'logs/%s/' % run_id
+    os.makedirs(logdir, exist_ok=True)
+    logfile = 'logs/%s.txt' % run_id
+    # create the log file
+    with open(logfile, "w") as f:
+        # begin the log by printing this file (the Python code)
+        f.write('='*100 + '\n')
+        f.write(code)
+        f.write('='*100 + '\n')
+        f.write(f"git_commit: {git_commit}\n")
+        f.write(f"seed: {args.seed}\n")
+        f.write("hyperparameters:\n")
+        f.write(json.dumps(dataclasses.asdict(args), indent=2))
+        f.write("\n")
+        # log information about the hardware/software environment this is running on
+        # and print the full `nvidia-smi` to file
+        f.write(f"Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:\n")
+        result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        f.write(f'{result.stdout}\n')
+        f.write('='*100 + '\n')
+
+training_time_ms = 0
+best_val_loss = float("inf")
+final_val_loss = None
+no_improve_count = 0
+early_stop_reason = None
+# start the clock
+torch.cuda.synchronize()
+t0 = time.time()
+# begin training
+train_loader.reset()
+for step in range(args.num_iterations + 1):
+    last_step = (step == args.num_iterations)
+    # This effectively ignores timing first 10 steps, which are slower for weird reasons.
+    # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
+    # steps with dummy data first, and then re-initialize the model and reset the loader.
+    if step == 10:
+        training_time_ms = 0
+        t0 = time.time()
+    timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
+
+    # once in a while evaluate the validation dataset
+    if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
+        # stop the clock
+        torch.cuda.synchronize()
+        training_time_ms += 1000 * (time.time() - t0)
+        # run validation batches
+        model.eval()
+        val_loader.reset()
+        val_loss = 0.0
+        for _ in range(val_steps):
+            x_val, y_val = val_loader.next_batch()
+            with ctx: # of course, we'd like to use no_grad() here too, but that creates a torch.compile error for some reason
+                _, loss = model(x_val, y_val, return_logits=False)
+                val_loss += loss.detach()
+                del loss
+        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+        val_loss /= val_steps
+        if not torch.isfinite(val_loss):
+            early_stop_reason = "non-finite val_loss"
+            final_val_loss = float("nan")
+            val_loss_item = float("nan")
+        else:
+            val_loss_item = val_loss.item()
+            final_val_loss = val_loss_item
+            if val_loss_item < best_val_loss - args.early_stop_min_delta:
+                best_val_loss = val_loss_item
+                no_improve_count = 0
+            else:
+                no_improve_count += 1
+        # log val loss to console and to logfile
+        if master_process:
+            print(f'step:{step}/{args.num_iterations} val_loss:{val_loss_item:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+            with open(logfile, "a") as f:
+                f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss_item:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
+            if early_stop_reason is None and args.early_stop_patience > 0 and no_improve_count >= args.early_stop_patience:
+                early_stop_reason = f"early_stop patience={args.early_stop_patience} min_delta={args.early_stop_min_delta}"
+        # start the clock again
+        torch.cuda.synchronize()
+        t0 = time.time()
+
+    if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
+        # stop the clock
+        torch.cuda.synchronize()
+        training_time_ms += 1000 * (time.time() - t0)
+        # save the state of the training process in a subdir to keep logs tidy
+        ckpt_dir = os.path.join(logdir, "checkpoints")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+        torch.save(log, os.path.join(ckpt_dir, f"state_step{step:06d}.pt"))
+        # start the clock again
+        torch.cuda.synchronize()
+        t0 = time.time()
+
+    # bit confusing: we want to make sure to eval on 0th iteration
+    # but also after the very last iteration. so we loop for step <= num_iterations
+    # instead of just < num_iterations (one extra due to <=), only to do
+    # the validation/sampling one last time, and then we break right here as we're done.
+    if last_step:
+        break
+
+    # --------------- TRAINING SECTION BEGIN -----------------
+    model.train()
+    for i in range(1, train_accumulation_steps+1):
+        # forward pass
+        with ctx:
+            _, loss = model(x, y, return_logits=False)
+            train_loss = loss.detach()
+        # advance the dataset for the next batch
+        x, y = train_loader.next_batch()
+        # backward pass
+        if i < train_accumulation_steps:
+            with model.no_sync(): # there's no need to sync gradients every accumulation step
+                loss.backward()
+        else:
+            loss.backward() # just sync on the last step
+    for p in model.parameters():
+        p.grad /= train_accumulation_steps
+    # step the optimizers and schedulers
+    for opt, sched in zip(optimizers, schedulers):
+        opt.step()
+        sched.step()
+    # null the gradients
+    model.zero_grad(set_to_none=True)
+    # --------------- TRAINING SECTION END -------------------
+    # everything that follows now is just diagnostics, prints, logging, etc.
+
+    #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
+    if master_process:
+        approx_time = training_time_ms + 1000 * (time.time() - t0)
+        print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+        with open(logfile, "a") as f:
+            f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
+    if early_stop_reason is not None:
+        break
+
+if master_process:
+    if early_stop_reason is not None:
+        print(f"stopped early: {early_stop_reason}")
+    print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+    timed_steps_final = max(args.num_iterations - 9, 1)
+    ms_per_step = training_time_ms / timed_steps_final
+    os.makedirs("experiments", exist_ok=True)
+    results_path = os.path.join("experiments", "results.csv")
+    fieldnames = [
+        "run_id",
+        "date",
+        "git_commit",
+        "seed",
+        "attn_gate",
+        "gate_pos",
+        "gate_act",
+        "learning_rate",
+        "batch_size",
+        "device_batch_size",
+        "sequence_length",
+        "num_iterations",
+        "warmdown_iters",
+        "final_val_loss",
+        "best_val_loss",
+        "train_time_ms",
+        "ms_per_step",
+        "gpu_name",
+        "n_gpus",
+        "runpod_instance",
+        "notes",
+    ]
+    final_loss_value = final_val_loss if final_val_loss is not None else float("nan")
+    best_loss_value = best_val_loss if best_val_loss < float("inf") else float("nan")
+    row = {
+        "run_id": run_id,
+        "date": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
+        "git_commit": git_commit,
+        "seed": args.seed,
+        "attn_gate": args.attn_gate,
+        "gate_pos": args.gate_pos,
+        "gate_act": args.gate_act,
+        "learning_rate": args.learning_rate,
+        "batch_size": args.batch_size,
+        "device_batch_size": args.device_batch_size,
+        "sequence_length": args.sequence_length,
+        "num_iterations": args.num_iterations,
+        "warmdown_iters": args.warmdown_iters,
+        "final_val_loss": final_loss_value,
+        "best_val_loss": best_loss_value,
+        "train_time_ms": training_time_ms,
+        "ms_per_step": ms_per_step,
+        "gpu_name": torch.cuda.get_device_name(ddp_local_rank),
+        "n_gpus": ddp_world_size,
+        "runpod_instance": os.environ.get("RUNPOD_INSTANCE_TYPE", "unknown"),
+        "notes": "",
+    }
+    write_header = not os.path.exists(results_path)
+    with open(results_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+====================================================================================================
+git_commit: bf6d1ff4b5e4ce7280e822ab33e90c4fb250e604
+seed: 2337
+hyperparameters:
+{
+  "input_bin": "data/fineweb10B/fineweb_train_*.bin",
+  "input_val_bin": "data/fineweb10B/fineweb_val_*.bin",
+  "batch_size": 512,
+  "device_batch_size": 64,
+  "sequence_length": 1024,
+  "num_iterations": 800,
+  "learning_rate": 0.0036,
+  "warmup_iters": 150,
+  "warmdown_iters": 1450,
+  "weight_decay": 0,
+  "seed": 2337,
+  "attn_gate": "elementwise",
+  "gate_pos": "sdpa",
+  "gate_act": "sigmoid",
+  "early_stop_patience": 2,
+  "early_stop_min_delta": 0.0,
+  "val_loss_every": 125,
+  "val_tokens": 10485760,
+  "save_every": 0
+}
+Running pytorch 2.8.0+cu128 compiled for CUDA 12.8
+nvidia-smi:
+Sun Dec  7 17:46:49 2025       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 575.57.08              Driver Version: 575.57.08      CUDA Version: 12.9     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA A100 80GB PCIe          On  |   00000000:00:07.0 Off |                    0 |
+| N/A   46C    P0            115W /  300W |    2276MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA A100 80GB PCIe          On  |   00000000:00:08.0 Off |                    0 |
+| N/A   48C    P0            122W /  300W |    2276MiB /  81920MiB |     18%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA A100 80GB PCIe          On  |   00000000:00:09.0 Off |                    0 |
+| N/A   44C    P0            108W /  300W |    2276MiB /  81920MiB |      2%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA A100 80GB PCIe          On  |   00000000:00:0A.0 Off |                    0 |
+| N/A   45C    P0            131W /  300W |    2276MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   4  NVIDIA A100 80GB PCIe          On  |   00000000:00:0B.0 Off |                    0 |
+| N/A   47C    P0            114W /  300W |    2276MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   5  NVIDIA A100 80GB PCIe          On  |   00000000:00:0C.0 Off |                    0 |
+| N/A   45C    P0            109W /  300W |    2276MiB /  81920MiB |     17%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   6  NVIDIA A100 80GB PCIe          On  |   00000000:00:0D.0 Off |                    0 |
+| N/A   47C    P0            122W /  300W |    2276MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   7  NVIDIA A100 80GB PCIe          On  |   00000000:00:0E.0 Off |                    0 |
+| N/A   47C    P0            114W /  300W |    2276MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
++-----------------------------------------------------------------------------------------+
+
+====================================================================================================
+step:0/800 val_loss:16.0092 train_time:259ms step_avg:nanms
+step:1/800 train_loss:16.0082 train_time:48892ms step_avg:nanms
+step:2/800 train_loss:15.8945 train_time:50112ms step_avg:nanms
+step:3/800 train_loss:15.6117 train_time:50526ms step_avg:nanms
+step:4/800 train_loss:15.0414 train_time:50941ms step_avg:nanms
+step:5/800 train_loss:13.9364 train_time:51357ms step_avg:nanms
+step:6/800 train_loss:12.4023 train_time:51773ms step_avg:nanms
+step:7/800 train_loss:10.8103 train_time:52190ms step_avg:nanms
+step:8/800 train_loss:9.9724 train_time:52605ms step_avg:nanms
+step:9/800 train_loss:9.6314 train_time:53021ms step_avg:nanms
+step:10/800 train_loss:9.4777 train_time:53436ms step_avg:nanms
+step:11/800 train_loss:9.3076 train_time:403ms step_avg:nanms
+step:12/800 train_loss:9.1553 train_time:817ms step_avg:nanms
+step:13/800 train_loss:8.9043 train_time:1232ms step_avg:410.82ms
+step:14/800 train_loss:8.7688 train_time:1650ms step_avg:412.60ms
+step:15/800 train_loss:8.5923 train_time:2066ms step_avg:413.23ms
+step:16/800 train_loss:8.3976 train_time:2480ms step_avg:413.35ms
+step:17/800 train_loss:8.2186 train_time:2895ms step_avg:413.59ms
+step:18/800 train_loss:8.0776 train_time:3309ms step_avg:413.66ms
+step:19/800 train_loss:7.8593 train_time:3723ms step_avg:413.67ms
+step:20/800 train_loss:7.7477 train_time:4138ms step_avg:413.76ms
+step:21/800 train_loss:7.3710 train_time:4554ms step_avg:414.03ms
+step:22/800 train_loss:7.5967 train_time:4970ms step_avg:414.16ms
+step:23/800 train_loss:7.7090 train_time:5385ms step_avg:414.23ms
+step:24/800 train_loss:7.3504 train_time:5801ms step_avg:414.33ms
+step:25/800 train_loss:7.4108 train_time:6214ms step_avg:414.29ms
+step:26/800 train_loss:7.1717 train_time:6630ms step_avg:414.37ms
+step:27/800 train_loss:7.0582 train_time:7049ms step_avg:414.65ms
+step:28/800 train_loss:7.2046 train_time:7463ms step_avg:414.63ms
+step:29/800 train_loss:6.8854 train_time:7878ms step_avg:414.62ms
+step:30/800 train_loss:7.1114 train_time:8293ms step_avg:414.64ms
+step:31/800 train_loss:6.9734 train_time:8709ms step_avg:414.69ms
+step:32/800 train_loss:6.8892 train_time:9125ms step_avg:414.77ms
+step:33/800 train_loss:6.6679 train_time:9542ms step_avg:414.88ms
+step:34/800 train_loss:7.0811 train_time:9960ms step_avg:414.99ms
+step:35/800 train_loss:6.8470 train_time:10376ms step_avg:415.04ms
+step:36/800 train_loss:7.0379 train_time:10792ms step_avg:415.10ms
+step:37/800 train_loss:6.9182 train_time:11209ms step_avg:415.13ms
+step:38/800 train_loss:6.7853 train_time:11626ms step_avg:415.21ms
+step:39/800 train_loss:6.6419 train_time:12042ms step_avg:415.25ms
+step:40/800 train_loss:6.7379 train_time:12459ms step_avg:415.28ms
+step:41/800 train_loss:6.6010 train_time:12874ms step_avg:415.28ms
+step:42/800 train_loss:6.6379 train_time:13291ms step_avg:415.34ms
+step:43/800 train_loss:6.4593 train_time:13707ms step_avg:415.35ms
+step:44/800 train_loss:6.5547 train_time:14123ms step_avg:415.39ms
+step:45/800 train_loss:6.5332 train_time:14541ms step_avg:415.45ms
+step:46/800 train_loss:6.7397 train_time:14956ms step_avg:415.45ms
+step:47/800 train_loss:6.5369 train_time:15373ms step_avg:415.49ms
+step:48/800 train_loss:6.3711 train_time:15790ms step_avg:415.54ms
+step:49/800 train_loss:6.6150 train_time:16207ms step_avg:415.56ms
+step:50/800 train_loss:6.4682 train_time:16624ms step_avg:415.59ms
+step:51/800 train_loss:6.6209 train_time:17040ms step_avg:415.60ms
+step:52/800 train_loss:6.4694 train_time:17456ms step_avg:415.62ms
+step:53/800 train_loss:6.2982 train_time:17875ms step_avg:415.71ms
+step:54/800 train_loss:6.4320 train_time:18292ms step_avg:415.73ms
+step:55/800 train_loss:6.3587 train_time:18709ms step_avg:415.75ms
+step:56/800 train_loss:6.6678 train_time:19126ms step_avg:415.79ms
+step:57/800 train_loss:6.3444 train_time:19544ms step_avg:415.83ms
+step:58/800 train_loss:6.2163 train_time:19962ms step_avg:415.87ms
+step:59/800 train_loss:6.3961 train_time:20379ms step_avg:415.90ms
+step:60/800 train_loss:6.2990 train_time:20796ms step_avg:415.92ms
+step:61/800 train_loss:6.4102 train_time:21215ms step_avg:415.98ms
+step:62/800 train_loss:6.2143 train_time:21634ms step_avg:416.03ms
+step:63/800 train_loss:6.2946 train_time:22053ms step_avg:416.09ms
+step:64/800 train_loss:6.2467 train_time:22472ms step_avg:416.15ms
+step:65/800 train_loss:6.7506 train_time:22890ms step_avg:416.18ms
+step:66/800 train_loss:6.0817 train_time:23308ms step_avg:416.22ms
+step:67/800 train_loss:6.2404 train_time:23725ms step_avg:416.22ms
+step:68/800 train_loss:6.1026 train_time:24144ms step_avg:416.28ms
+step:69/800 train_loss:6.4307 train_time:24563ms step_avg:416.32ms
+step:70/800 train_loss:6.0298 train_time:24981ms step_avg:416.34ms
+step:71/800 train_loss:6.0799 train_time:25399ms step_avg:416.37ms
+step:72/800 train_loss:6.2891 train_time:25815ms step_avg:416.37ms
+step:73/800 train_loss:6.1995 train_time:26233ms step_avg:416.40ms
+step:74/800 train_loss:6.1027 train_time:26653ms step_avg:416.45ms
+step:75/800 train_loss:6.1982 train_time:27070ms step_avg:416.47ms
+step:76/800 train_loss:6.1446 train_time:27489ms step_avg:416.50ms
+step:77/800 train_loss:6.1447 train_time:27907ms step_avg:416.52ms
+step:78/800 train_loss:6.2045 train_time:28324ms step_avg:416.53ms
+step:79/800 train_loss:6.3069 train_time:28741ms step_avg:416.54ms
+step:80/800 train_loss:6.1146 train_time:29158ms step_avg:416.54ms
+step:81/800 train_loss:6.2084 train_time:29575ms step_avg:416.55ms
+step:82/800 train_loss:5.9302 train_time:29993ms step_avg:416.57ms
+step:83/800 train_loss:6.1263 train_time:30411ms step_avg:416.59ms
+step:84/800 train_loss:6.1064 train_time:30830ms step_avg:416.62ms
+step:85/800 train_loss:6.0241 train_time:31252ms step_avg:416.69ms
+step:86/800 train_loss:5.8918 train_time:31670ms step_avg:416.71ms
+step:87/800 train_loss:6.1055 train_time:32088ms step_avg:416.73ms
+step:88/800 train_loss:6.0131 train_time:32506ms step_avg:416.74ms
+step:89/800 train_loss:6.0985 train_time:32924ms step_avg:416.76ms
+step:90/800 train_loss:6.0822 train_time:33343ms step_avg:416.79ms
+step:91/800 train_loss:5.9750 train_time:33761ms step_avg:416.80ms
+step:92/800 train_loss:5.9736 train_time:34180ms step_avg:416.82ms
+step:93/800 train_loss:6.0697 train_time:34597ms step_avg:416.83ms
+step:94/800 train_loss:5.9359 train_time:35015ms step_avg:416.85ms
+step:95/800 train_loss:5.9078 train_time:35433ms step_avg:416.86ms
+step:96/800 train_loss:5.9110 train_time:35854ms step_avg:416.91ms
+step:97/800 train_loss:5.8186 train_time:36271ms step_avg:416.91ms
+step:98/800 train_loss:5.9096 train_time:36688ms step_avg:416.91ms
+step:99/800 train_loss:5.8116 train_time:37105ms step_avg:416.91ms
+step:100/800 train_loss:5.9535 train_time:37524ms step_avg:416.93ms
+step:101/800 train_loss:5.8986 train_time:37943ms step_avg:416.95ms
+step:102/800 train_loss:5.7870 train_time:38360ms step_avg:416.96ms
+step:103/800 train_loss:5.9034 train_time:38777ms step_avg:416.95ms
+step:104/800 train_loss:5.8887 train_time:39196ms step_avg:416.98ms
+step:105/800 train_loss:5.6878 train_time:39614ms step_avg:416.99ms
+step:106/800 train_loss:5.8185 train_time:40031ms step_avg:416.99ms
+step:107/800 train_loss:6.0254 train_time:40452ms step_avg:417.03ms
+step:108/800 train_loss:5.7985 train_time:40872ms step_avg:417.07ms
+step:109/800 train_loss:5.5226 train_time:41291ms step_avg:417.08ms
+step:110/800 train_loss:5.7636 train_time:41710ms step_avg:417.10ms
+step:111/800 train_loss:5.7068 train_time:42129ms step_avg:417.11ms
+step:112/800 train_loss:5.6896 train_time:42548ms step_avg:417.13ms
+step:113/800 train_loss:5.7871 train_time:42964ms step_avg:417.13ms
+step:114/800 train_loss:5.7129 train_time:43381ms step_avg:417.13ms
+step:115/800 train_loss:5.5559 train_time:43799ms step_avg:417.14ms
+step:116/800 train_loss:5.7554 train_time:44217ms step_avg:417.14ms
+step:117/800 train_loss:5.5622 train_time:44634ms step_avg:417.14ms
+step:118/800 train_loss:5.5757 train_time:45053ms step_avg:417.16ms
+step:119/800 train_loss:5.6740 train_time:45471ms step_avg:417.16ms
+step:120/800 train_loss:5.7167 train_time:45889ms step_avg:417.17ms
+step:121/800 train_loss:5.6097 train_time:46308ms step_avg:417.19ms
+step:122/800 train_loss:5.4986 train_time:46729ms step_avg:417.22ms
+step:123/800 train_loss:5.5827 train_time:47151ms step_avg:417.27ms
+step:124/800 train_loss:5.4290 train_time:47568ms step_avg:417.26ms
+step:125/800 train_loss:5.7441 train_time:47986ms step_avg:417.27ms
+step:125/800 val_loss:5.5805 train_time:48000ms step_avg:417.39ms
+step:126/800 train_loss:5.5894 train_time:48402ms step_avg:417.26ms
+step:127/800 train_loss:5.5584 train_time:48820ms step_avg:417.27ms
+step:128/800 train_loss:5.6337 train_time:49240ms step_avg:417.28ms
+step:129/800 train_loss:5.4687 train_time:49658ms step_avg:417.29ms
+step:130/800 train_loss:5.7401 train_time:50076ms step_avg:417.30ms
+step:131/800 train_loss:5.5310 train_time:50494ms step_avg:417.31ms
+step:132/800 train_loss:5.5426 train_time:50912ms step_avg:417.31ms
+step:133/800 train_loss:5.4654 train_time:51331ms step_avg:417.33ms
+step:134/800 train_loss:5.5058 train_time:51749ms step_avg:417.33ms
+step:135/800 train_loss:5.4484 train_time:52166ms step_avg:417.33ms
+step:136/800 train_loss:5.4883 train_time:52584ms step_avg:417.33ms
+step:137/800 train_loss:5.2830 train_time:53003ms step_avg:417.35ms
+step:138/800 train_loss:5.4378 train_time:53422ms step_avg:417.36ms
+step:139/800 train_loss:5.4152 train_time:53840ms step_avg:417.37ms
+step:140/800 train_loss:5.4171 train_time:54259ms step_avg:417.37ms
+step:141/800 train_loss:5.4451 train_time:54676ms step_avg:417.38ms
+step:142/800 train_loss:5.3434 train_time:55095ms step_avg:417.39ms
+step:143/800 train_loss:5.4392 train_time:55514ms step_avg:417.40ms
+step:144/800 train_loss:5.2323 train_time:55931ms step_avg:417.40ms
+step:145/800 train_loss:5.4068 train_time:56349ms step_avg:417.40ms
+step:146/800 train_loss:5.3352 train_time:56768ms step_avg:417.41ms
+step:147/800 train_loss:5.2343 train_time:57185ms step_avg:417.41ms
+step:148/800 train_loss:5.3579 train_time:57605ms step_avg:417.43ms
+step:149/800 train_loss:5.3296 train_time:58023ms step_avg:417.43ms
+step:150/800 train_loss:5.4146 train_time:58442ms step_avg:417.44ms
+step:151/800 train_loss:5.4005 train_time:58861ms step_avg:417.45ms
+step:152/800 train_loss:5.2857 train_time:59280ms step_avg:417.46ms
+step:153/800 train_loss:5.2588 train_time:59704ms step_avg:417.51ms
+step:154/800 train_loss:5.3270 train_time:60124ms step_avg:417.52ms
+step:155/800 train_loss:5.2588 train_time:60541ms step_avg:417.52ms
+step:156/800 train_loss:5.2387 train_time:60960ms step_avg:417.53ms
+step:157/800 train_loss:5.2368 train_time:61379ms step_avg:417.54ms
+step:158/800 train_loss:5.3763 train_time:61802ms step_avg:417.58ms
+step:159/800 train_loss:5.1418 train_time:62220ms step_avg:417.59ms
+step:160/800 train_loss:5.2022 train_time:62639ms step_avg:417.59ms
+step:161/800 train_loss:5.0604 train_time:63058ms step_avg:417.60ms
+step:162/800 train_loss:5.2072 train_time:63477ms step_avg:417.61ms
+step:163/800 train_loss:5.2441 train_time:63899ms step_avg:417.64ms
+step:164/800 train_loss:5.2351 train_time:64317ms step_avg:417.65ms
+step:165/800 train_loss:5.0407 train_time:64735ms step_avg:417.65ms
+step:166/800 train_loss:5.1610 train_time:65156ms step_avg:417.67ms
+step:167/800 train_loss:5.3219 train_time:65574ms step_avg:417.67ms
+step:168/800 train_loss:5.0971 train_time:65993ms step_avg:417.68ms
+step:169/800 train_loss:5.1903 train_time:66413ms step_avg:417.69ms
+step:170/800 train_loss:5.0416 train_time:66831ms step_avg:417.69ms
+step:171/800 train_loss:4.9852 train_time:67249ms step_avg:417.69ms
+step:172/800 train_loss:5.0818 train_time:67668ms step_avg:417.70ms
+step:173/800 train_loss:5.0537 train_time:68088ms step_avg:417.72ms
+step:174/800 train_loss:5.1173 train_time:68508ms step_avg:417.73ms
+step:175/800 train_loss:5.2533 train_time:68927ms step_avg:417.74ms
+step:176/800 train_loss:5.1422 train_time:69346ms step_avg:417.75ms
+step:177/800 train_loss:4.9783 train_time:69765ms step_avg:417.75ms
+step:178/800 train_loss:4.9510 train_time:70183ms step_avg:417.75ms
+step:179/800 train_loss:4.9868 train_time:70602ms step_avg:417.77ms
+step:180/800 train_loss:5.0355 train_time:71022ms step_avg:417.78ms
+step:181/800 train_loss:5.0112 train_time:71442ms step_avg:417.79ms
+step:182/800 train_loss:5.1318 train_time:71862ms step_avg:417.80ms
+step:183/800 train_loss:5.0109 train_time:72281ms step_avg:417.81ms
+step:184/800 train_loss:4.9452 train_time:72701ms step_avg:417.82ms
+step:185/800 train_loss:4.9643 train_time:73119ms step_avg:417.82ms
+step:186/800 train_loss:5.0912 train_time:73538ms step_avg:417.83ms
+step:187/800 train_loss:4.9715 train_time:73958ms step_avg:417.84ms
+step:188/800 train_loss:5.2258 train_time:74375ms step_avg:417.84ms
+step:189/800 train_loss:5.0118 train_time:75589ms step_avg:422.29ms
+step:190/800 train_loss:4.9235 train_time:76149ms step_avg:423.05ms
+step:191/800 train_loss:5.0847 train_time:76565ms step_avg:423.01ms
+step:192/800 train_loss:4.9180 train_time:76983ms step_avg:422.98ms
+step:193/800 train_loss:4.8397 train_time:77402ms step_avg:422.96ms
+step:194/800 train_loss:5.0464 train_time:77822ms step_avg:422.94ms
+step:195/800 train_loss:4.9831 train_time:78239ms step_avg:422.91ms
+step:196/800 train_loss:5.1722 train_time:78657ms step_avg:422.89ms
+step:197/800 train_loss:5.0562 train_time:79075ms step_avg:422.86ms
+step:198/800 train_loss:4.8882 train_time:79493ms step_avg:422.84ms
+step:199/800 train_loss:4.9281 train_time:79916ms step_avg:422.84ms
+step:200/800 train_loss:4.8259 train_time:80334ms step_avg:422.81ms
+step:201/800 train_loss:4.9095 train_time:80750ms step_avg:422.78ms
+step:202/800 train_loss:4.8325 train_time:81169ms step_avg:422.75ms
+step:203/800 train_loss:5.0646 train_time:81587ms step_avg:422.73ms
+step:204/800 train_loss:4.9580 train_time:82005ms step_avg:422.70ms
+step:205/800 train_loss:4.9196 train_time:82422ms step_avg:422.68ms
+step:206/800 train_loss:5.0793 train_time:82840ms step_avg:422.65ms
+step:207/800 train_loss:4.7523 train_time:83259ms step_avg:422.63ms
+step:208/800 train_loss:4.8999 train_time:83679ms step_avg:422.62ms
+step:209/800 train_loss:4.8525 train_time:84102ms step_avg:422.62ms
+step:210/800 train_loss:5.0254 train_time:84519ms step_avg:422.59ms
+step:211/800 train_loss:4.9350 train_time:84937ms step_avg:422.57ms
+step:212/800 train_loss:4.8235 train_time:85355ms step_avg:422.55ms
+step:213/800 train_loss:4.9839 train_time:85773ms step_avg:422.53ms
+step:214/800 train_loss:4.7919 train_time:86193ms step_avg:422.52ms
+step:215/800 train_loss:4.8837 train_time:86610ms step_avg:422.49ms
+step:216/800 train_loss:4.7361 train_time:87027ms step_avg:422.46ms
+step:217/800 train_loss:4.8806 train_time:87448ms step_avg:422.45ms
+step:218/800 train_loss:4.8511 train_time:87867ms step_avg:422.44ms
+step:219/800 train_loss:4.8137 train_time:88286ms step_avg:422.42ms
+step:220/800 train_loss:4.8224 train_time:88704ms step_avg:422.40ms
+step:221/800 train_loss:4.8479 train_time:89123ms step_avg:422.38ms
+step:222/800 train_loss:4.9003 train_time:89540ms step_avg:422.36ms
+step:223/800 train_loss:4.8315 train_time:89959ms step_avg:422.34ms
+step:224/800 train_loss:4.8405 train_time:90377ms step_avg:422.32ms
+step:225/800 train_loss:4.9588 train_time:90795ms step_avg:422.30ms
+step:226/800 train_loss:4.7045 train_time:91214ms step_avg:422.29ms
+step:227/800 train_loss:4.7336 train_time:91632ms step_avg:422.27ms
+step:228/800 train_loss:4.7148 train_time:92062ms step_avg:422.30ms
+step:229/800 train_loss:4.8779 train_time:92478ms step_avg:422.28ms
+step:230/800 train_loss:4.7177 train_time:92899ms step_avg:422.27ms
+step:231/800 train_loss:4.8660 train_time:93317ms step_avg:422.25ms
+step:232/800 train_loss:4.7292 train_time:93733ms step_avg:422.22ms
+step:233/800 train_loss:4.6845 train_time:94151ms step_avg:422.20ms
+step:234/800 train_loss:4.8955 train_time:94570ms step_avg:422.19ms
+step:235/800 train_loss:4.7257 train_time:94990ms step_avg:422.18ms
+step:236/800 train_loss:4.6628 train_time:95409ms step_avg:422.16ms
+step:237/800 train_loss:4.9206 train_time:95827ms step_avg:422.15ms
+step:238/800 train_loss:4.7986 train_time:96246ms step_avg:422.13ms
+step:239/800 train_loss:4.7131 train_time:96666ms step_avg:422.12ms
+step:240/800 train_loss:4.8548 train_time:97085ms step_avg:422.11ms
+step:241/800 train_loss:4.8417 train_time:97505ms step_avg:422.10ms
+step:242/800 train_loss:4.7433 train_time:97923ms step_avg:422.08ms
+step:243/800 train_loss:4.9123 train_time:98342ms step_avg:422.07ms
+step:244/800 train_loss:4.7251 train_time:98760ms step_avg:422.05ms
+step:245/800 train_loss:4.7303 train_time:99178ms step_avg:422.03ms
+step:246/800 train_loss:4.8053 train_time:99599ms step_avg:422.03ms
+step:247/800 train_loss:4.7615 train_time:100019ms step_avg:422.02ms
+step:248/800 train_loss:4.7224 train_time:100438ms step_avg:422.01ms
+step:249/800 train_loss:4.8873 train_time:100857ms step_avg:421.99ms
+step:250/800 train_loss:4.6163 train_time:101275ms step_avg:421.98ms
+step:250/800 val_loss:4.7281 train_time:101300ms step_avg:422.08ms
+step:251/800 train_loss:4.6595 train_time:101708ms step_avg:422.02ms
+step:252/800 train_loss:4.7942 train_time:102125ms step_avg:422.00ms
+step:253/800 train_loss:4.7796 train_time:102543ms step_avg:421.99ms
+step:254/800 train_loss:4.6617 train_time:102963ms step_avg:421.98ms
+step:255/800 train_loss:4.6897 train_time:103381ms step_avg:421.96ms
+step:256/800 train_loss:4.8211 train_time:103800ms step_avg:421.95ms
+step:257/800 train_loss:4.7692 train_time:104217ms step_avg:421.93ms
+step:258/800 train_loss:4.7280 train_time:104635ms step_avg:421.92ms
+step:259/800 train_loss:4.6519 train_time:105054ms step_avg:421.90ms
+step:260/800 train_loss:4.6657 train_time:105474ms step_avg:421.89ms
+step:261/800 train_loss:4.7435 train_time:105894ms step_avg:421.89ms
+step:262/800 train_loss:4.7533 train_time:106313ms step_avg:421.88ms
+step:263/800 train_loss:4.6568 train_time:106731ms step_avg:421.86ms
+step:264/800 train_loss:4.6042 train_time:107149ms step_avg:421.85ms
+step:265/800 train_loss:4.6503 train_time:107570ms step_avg:421.84ms
+step:266/800 train_loss:4.5136 train_time:107989ms step_avg:421.83ms
+step:267/800 train_loss:4.5651 train_time:108407ms step_avg:421.82ms
+step:268/800 train_loss:4.6109 train_time:108826ms step_avg:421.81ms
+step:269/800 train_loss:4.5596 train_time:109243ms step_avg:421.79ms
+step:270/800 train_loss:4.5267 train_time:109661ms step_avg:421.77ms
+step:271/800 train_loss:4.7560 train_time:110079ms step_avg:421.76ms
+step:272/800 train_loss:4.6860 train_time:110498ms step_avg:421.75ms
+step:273/800 train_loss:4.5443 train_time:110916ms step_avg:421.73ms
+step:274/800 train_loss:4.5927 train_time:111334ms step_avg:421.72ms
+step:275/800 train_loss:4.7180 train_time:111752ms step_avg:421.71ms
+step:276/800 train_loss:4.7254 train_time:112170ms step_avg:421.69ms
+step:277/800 train_loss:4.9333 train_time:112590ms step_avg:421.69ms
+step:278/800 train_loss:4.6680 train_time:113008ms step_avg:421.67ms
+step:279/800 train_loss:4.7977 train_time:113426ms step_avg:421.66ms
+step:280/800 train_loss:4.6465 train_time:113844ms step_avg:421.65ms
+step:281/800 train_loss:4.7007 train_time:114263ms step_avg:421.64ms
+step:282/800 train_loss:4.6105 train_time:114681ms step_avg:421.62ms
+step:283/800 train_loss:4.7227 train_time:115100ms step_avg:421.61ms
+step:284/800 train_loss:4.5392 train_time:115519ms step_avg:421.60ms
+step:285/800 train_loss:4.7058 train_time:115936ms step_avg:421.59ms
+step:286/800 train_loss:4.6999 train_time:116355ms step_avg:421.58ms
+step:287/800 train_loss:4.7359 train_time:116772ms step_avg:421.56ms
+step:288/800 train_loss:4.5888 train_time:117191ms step_avg:421.55ms
+step:289/800 train_loss:4.6520 train_time:117611ms step_avg:421.54ms
+step:290/800 train_loss:4.5130 train_time:118031ms step_avg:421.54ms
+step:291/800 train_loss:4.5079 train_time:118448ms step_avg:421.52ms
+step:292/800 train_loss:4.6196 train_time:118869ms step_avg:421.52ms
+step:293/800 train_loss:4.5161 train_time:119295ms step_avg:421.54ms
+step:294/800 train_loss:4.5786 train_time:119715ms step_avg:421.53ms
+step:295/800 train_loss:4.5817 train_time:120134ms step_avg:421.52ms
+step:296/800 train_loss:4.4536 train_time:120553ms step_avg:421.51ms
+step:297/800 train_loss:4.4340 train_time:120971ms step_avg:421.50ms
+step:298/800 train_loss:4.4747 train_time:121390ms step_avg:421.49ms
+step:299/800 train_loss:4.5775 train_time:121809ms step_avg:421.48ms
+step:300/800 train_loss:4.4537 train_time:122227ms step_avg:421.47ms
+step:301/800 train_loss:4.6431 train_time:122646ms step_avg:421.46ms
+step:302/800 train_loss:4.6170 train_time:123069ms step_avg:421.47ms
+step:303/800 train_loss:4.5255 train_time:123490ms step_avg:421.47ms
+step:304/800 train_loss:4.6048 train_time:123908ms step_avg:421.45ms
+step:305/800 train_loss:4.5833 train_time:124326ms step_avg:421.44ms
+step:306/800 train_loss:5.0642 train_time:124745ms step_avg:421.44ms
+step:307/800 train_loss:4.5387 train_time:125167ms step_avg:421.44ms
+step:308/800 train_loss:4.4393 train_time:125585ms step_avg:421.43ms
+step:309/800 train_loss:4.6306 train_time:126005ms step_avg:421.42ms
+step:310/800 train_loss:4.4266 train_time:126424ms step_avg:421.41ms
+step:311/800 train_loss:4.6672 train_time:126841ms step_avg:421.40ms
+step:312/800 train_loss:4.5679 train_time:127259ms step_avg:421.39ms
+step:313/800 train_loss:4.4799 train_time:127678ms step_avg:421.38ms
+step:314/800 train_loss:4.6211 train_time:128098ms step_avg:421.37ms
+step:315/800 train_loss:4.7534 train_time:128515ms step_avg:421.36ms
+step:316/800 train_loss:4.5784 train_time:128935ms step_avg:421.35ms
+step:317/800 train_loss:4.4688 train_time:129353ms step_avg:421.34ms
+step:318/800 train_loss:4.4689 train_time:129772ms step_avg:421.34ms
+step:319/800 train_loss:4.4897 train_time:130191ms step_avg:421.33ms
+step:320/800 train_loss:4.4410 train_time:130609ms step_avg:421.32ms
+step:321/800 train_loss:4.5277 train_time:131029ms step_avg:421.31ms
+step:322/800 train_loss:4.5471 train_time:131447ms step_avg:421.30ms
+step:323/800 train_loss:4.5027 train_time:131870ms step_avg:421.31ms
+step:324/800 train_loss:4.5858 train_time:132290ms step_avg:421.31ms
+step:325/800 train_loss:4.5690 train_time:132709ms step_avg:421.30ms
+step:326/800 train_loss:4.6423 train_time:133130ms step_avg:421.30ms
+step:327/800 train_loss:4.4857 train_time:133549ms step_avg:421.29ms
+step:328/800 train_loss:4.9574 train_time:133970ms step_avg:421.29ms
+step:329/800 train_loss:4.6434 train_time:134388ms step_avg:421.28ms
+step:330/800 train_loss:4.4239 train_time:134806ms step_avg:421.27ms
+step:331/800 train_loss:4.4017 train_time:135223ms step_avg:421.26ms
+step:332/800 train_loss:4.5521 train_time:135642ms step_avg:421.25ms
+step:333/800 train_loss:4.4646 train_time:136061ms step_avg:421.24ms
+step:334/800 train_loss:4.4592 train_time:136481ms step_avg:421.24ms
+step:335/800 train_loss:4.4092 train_time:136899ms step_avg:421.23ms
+step:336/800 train_loss:4.6087 train_time:137319ms step_avg:421.22ms
+step:337/800 train_loss:4.5302 train_time:137740ms step_avg:421.22ms
+step:338/800 train_loss:5.0900 train_time:138157ms step_avg:421.21ms
+step:339/800 train_loss:4.5122 train_time:138575ms step_avg:421.20ms
+step:340/800 train_loss:4.4850 train_time:138993ms step_avg:421.19ms
+step:341/800 train_loss:4.4620 train_time:139410ms step_avg:421.18ms
+step:342/800 train_loss:4.4032 train_time:139829ms step_avg:421.17ms
+step:343/800 train_loss:4.3740 train_time:140248ms step_avg:421.17ms
+step:344/800 train_loss:4.4416 train_time:140672ms step_avg:421.17ms
+step:345/800 train_loss:4.5322 train_time:141090ms step_avg:421.17ms
+step:346/800 train_loss:4.4201 train_time:141509ms step_avg:421.16ms
+step:347/800 train_loss:4.3607 train_time:141928ms step_avg:421.15ms
+step:348/800 train_loss:4.4095 train_time:142346ms step_avg:421.14ms
+step:349/800 train_loss:4.4079 train_time:142766ms step_avg:421.14ms
+step:350/800 train_loss:4.3404 train_time:143184ms step_avg:421.13ms
+step:351/800 train_loss:4.0282 train_time:143602ms step_avg:421.12ms
+step:352/800 train_loss:4.3192 train_time:144021ms step_avg:421.12ms
+step:353/800 train_loss:4.6816 train_time:144441ms step_avg:421.11ms
+step:354/800 train_loss:4.1985 train_time:144859ms step_avg:421.10ms
+step:355/800 train_loss:4.4470 train_time:145277ms step_avg:421.09ms
+step:356/800 train_loss:4.3517 train_time:145696ms step_avg:421.09ms
+step:357/800 train_loss:4.4432 train_time:146115ms step_avg:421.08ms
+step:358/800 train_loss:4.4600 train_time:146536ms step_avg:421.08ms
+step:359/800 train_loss:4.3620 train_time:146954ms step_avg:421.07ms
+step:360/800 train_loss:4.6775 train_time:147373ms step_avg:421.07ms
+step:361/800 train_loss:4.0743 train_time:147793ms step_avg:421.06ms
+step:362/800 train_loss:4.5594 train_time:148211ms step_avg:421.05ms
+step:363/800 train_loss:4.4640 train_time:148630ms step_avg:421.05ms
+step:364/800 train_loss:4.3447 train_time:149050ms step_avg:421.04ms
+step:365/800 train_loss:4.2784 train_time:149470ms step_avg:421.04ms
+step:366/800 train_loss:4.4480 train_time:149888ms step_avg:421.03ms
+step:367/800 train_loss:4.3719 train_time:150308ms step_avg:421.03ms
+step:368/800 train_loss:4.3590 train_time:150728ms step_avg:421.03ms
+step:369/800 train_loss:4.3562 train_time:151147ms step_avg:421.02ms
+step:370/800 train_loss:4.2452 train_time:151568ms step_avg:421.02ms
+step:371/800 train_loss:4.3902 train_time:151987ms step_avg:421.02ms
+step:372/800 train_loss:4.3215 train_time:152405ms step_avg:421.01ms
+step:373/800 train_loss:4.2010 train_time:152823ms step_avg:421.00ms
+step:374/800 train_loss:4.4002 train_time:153241ms step_avg:420.99ms
+step:375/800 train_loss:4.3310 train_time:153659ms step_avg:420.98ms
+step:375/800 val_loss:4.3436 train_time:153674ms step_avg:421.02ms
+step:376/800 train_loss:4.3209 train_time:154082ms step_avg:420.99ms
+step:377/800 train_loss:4.3807 train_time:154499ms step_avg:420.98ms
+step:378/800 train_loss:4.2676 train_time:155031ms step_avg:421.28ms
+step:379/800 train_loss:4.3308 train_time:155450ms step_avg:421.28ms
+step:380/800 train_loss:4.3918 train_time:155992ms step_avg:421.60ms
+step:381/800 train_loss:4.4332 train_time:156409ms step_avg:421.59ms
+step:382/800 train_loss:4.3648 train_time:156827ms step_avg:421.58ms
+step:383/800 train_loss:4.3442 train_time:157245ms step_avg:421.57ms
+step:384/800 train_loss:4.2542 train_time:157666ms step_avg:421.57ms
+step:385/800 train_loss:4.3496 train_time:158085ms step_avg:421.56ms
+step:386/800 train_loss:4.2699 train_time:158502ms step_avg:421.55ms
+step:387/800 train_loss:4.3924 train_time:158920ms step_avg:421.54ms
+step:388/800 train_loss:4.5934 train_time:159340ms step_avg:421.54ms
+step:389/800 train_loss:4.2860 train_time:159758ms step_avg:421.52ms
+step:390/800 train_loss:4.2503 train_time:160176ms step_avg:421.52ms
+step:391/800 train_loss:4.3751 train_time:160594ms step_avg:421.51ms
+step:392/800 train_loss:4.2859 train_time:161013ms step_avg:421.50ms
+step:393/800 train_loss:4.3972 train_time:161430ms step_avg:421.49ms
+step:394/800 train_loss:4.2187 train_time:161849ms step_avg:421.48ms
+step:395/800 train_loss:4.3562 train_time:162267ms step_avg:421.47ms
+step:396/800 train_loss:4.1241 train_time:162685ms step_avg:421.46ms
+step:397/800 train_loss:4.2982 train_time:163103ms step_avg:421.45ms
+step:398/800 train_loss:4.3856 train_time:163521ms step_avg:421.45ms
+step:399/800 train_loss:4.3437 train_time:163941ms step_avg:421.44ms
+step:400/800 train_loss:4.2541 train_time:164360ms step_avg:421.43ms
+step:401/800 train_loss:4.3194 train_time:164779ms step_avg:421.43ms
+step:402/800 train_loss:4.3603 train_time:165197ms step_avg:421.42ms
+step:403/800 train_loss:4.3201 train_time:165615ms step_avg:421.41ms
+step:404/800 train_loss:4.4197 train_time:166033ms step_avg:421.40ms
+step:405/800 train_loss:4.1973 train_time:166453ms step_avg:421.40ms
+step:406/800 train_loss:4.2487 train_time:166870ms step_avg:421.39ms
+step:407/800 train_loss:4.5268 train_time:167288ms step_avg:421.38ms
+step:408/800 train_loss:4.2769 train_time:167707ms step_avg:421.37ms
+step:409/800 train_loss:4.2740 train_time:168123ms step_avg:421.36ms
+step:410/800 train_loss:4.3209 train_time:168542ms step_avg:421.35ms
+step:411/800 train_loss:4.2000 train_time:168962ms step_avg:421.35ms
+step:412/800 train_loss:4.2266 train_time:169382ms step_avg:421.35ms
+step:413/800 train_loss:4.6368 train_time:169801ms step_avg:421.34ms
+step:414/800 train_loss:4.0949 train_time:170220ms step_avg:421.34ms
+step:415/800 train_loss:4.4619 train_time:170642ms step_avg:421.34ms
+step:416/800 train_loss:4.2232 train_time:171061ms step_avg:421.33ms
+step:417/800 train_loss:4.2238 train_time:171479ms step_avg:421.33ms
+step:418/800 train_loss:4.4064 train_time:171898ms step_avg:421.32ms
+step:419/800 train_loss:4.1422 train_time:172316ms step_avg:421.31ms
+step:420/800 train_loss:4.2363 train_time:172735ms step_avg:421.30ms
+step:421/800 train_loss:4.1976 train_time:173152ms step_avg:421.30ms
+step:422/800 train_loss:4.0940 train_time:173570ms step_avg:421.29ms
+step:423/800 train_loss:4.2094 train_time:173990ms step_avg:421.28ms
+step:424/800 train_loss:4.3122 train_time:174408ms step_avg:421.28ms
+step:425/800 train_loss:4.0981 train_time:174827ms step_avg:421.27ms
+step:426/800 train_loss:4.2636 train_time:175246ms step_avg:421.26ms
+step:427/800 train_loss:4.1485 train_time:175666ms step_avg:421.26ms
+step:428/800 train_loss:4.3455 train_time:176083ms step_avg:421.25ms
+step:429/800 train_loss:4.2710 train_time:176500ms step_avg:421.24ms
+step:430/800 train_loss:4.1904 train_time:176919ms step_avg:421.24ms
+step:431/800 train_loss:4.1692 train_time:177343ms step_avg:421.24ms
+step:432/800 train_loss:4.1042 train_time:177761ms step_avg:421.23ms
+step:433/800 train_loss:4.1962 train_time:178180ms step_avg:421.23ms
+step:434/800 train_loss:4.2743 train_time:178600ms step_avg:421.23ms
+step:435/800 train_loss:4.2041 train_time:179020ms step_avg:421.22ms
+step:436/800 train_loss:4.2480 train_time:179442ms step_avg:421.23ms
+step:437/800 train_loss:4.2611 train_time:179859ms step_avg:421.22ms
+step:438/800 train_loss:4.1367 train_time:180278ms step_avg:421.21ms
+step:439/800 train_loss:4.1591 train_time:180697ms step_avg:421.20ms
+step:440/800 train_loss:4.1348 train_time:181115ms step_avg:421.20ms
+step:441/800 train_loss:4.3115 train_time:181533ms step_avg:421.19ms
+step:442/800 train_loss:4.2043 train_time:181953ms step_avg:421.19ms
+step:443/800 train_loss:4.1870 train_time:182370ms step_avg:421.18ms
+step:444/800 train_loss:4.0788 train_time:182788ms step_avg:421.17ms
+step:445/800 train_loss:4.3336 train_time:183208ms step_avg:421.17ms
+step:446/800 train_loss:4.2630 train_time:183626ms step_avg:421.16ms
+step:447/800 train_loss:4.2624 train_time:184043ms step_avg:421.15ms
+step:448/800 train_loss:4.1737 train_time:184462ms step_avg:421.15ms
+step:449/800 train_loss:4.2721 train_time:184880ms step_avg:421.14ms
+step:450/800 train_loss:4.0944 train_time:185298ms step_avg:421.13ms
+step:451/800 train_loss:4.1346 train_time:185715ms step_avg:421.12ms
+step:452/800 train_loss:4.0181 train_time:186133ms step_avg:421.12ms
+step:453/800 train_loss:4.1183 train_time:186552ms step_avg:421.11ms
+step:454/800 train_loss:4.1014 train_time:186971ms step_avg:421.11ms
+step:455/800 train_loss:4.0620 train_time:187389ms step_avg:421.10ms
+step:456/800 train_loss:4.2763 train_time:187807ms step_avg:421.09ms
+step:457/800 train_loss:4.1398 train_time:188225ms step_avg:421.08ms
+step:458/800 train_loss:4.2226 train_time:188643ms step_avg:421.08ms
+step:459/800 train_loss:4.2469 train_time:189061ms step_avg:421.07ms
+step:460/800 train_loss:4.0506 train_time:189480ms step_avg:421.07ms
+step:461/800 train_loss:4.2235 train_time:189898ms step_avg:421.06ms
+step:462/800 train_loss:4.1223 train_time:190318ms step_avg:421.06ms
+step:463/800 train_loss:4.1173 train_time:190739ms step_avg:421.06ms
+step:464/800 train_loss:4.1958 train_time:191157ms step_avg:421.05ms
+step:465/800 train_loss:4.1320 train_time:191576ms step_avg:421.05ms
+step:466/800 train_loss:4.1357 train_time:191994ms step_avg:421.04ms
+step:467/800 train_loss:4.2529 train_time:192413ms step_avg:421.04ms
+step:468/800 train_loss:4.2508 train_time:192833ms step_avg:421.03ms
+step:469/800 train_loss:4.2219 train_time:193251ms step_avg:421.03ms
+step:470/800 train_loss:4.1230 train_time:193669ms step_avg:421.02ms
+step:471/800 train_loss:4.1987 train_time:194088ms step_avg:421.01ms
+step:472/800 train_loss:4.2488 train_time:194505ms step_avg:421.01ms
+step:473/800 train_loss:4.1732 train_time:194922ms step_avg:421.00ms
+step:474/800 train_loss:4.1392 train_time:195343ms step_avg:421.00ms
+step:475/800 train_loss:3.9983 train_time:195762ms step_avg:420.99ms
+step:476/800 train_loss:4.4402 train_time:196180ms step_avg:420.99ms
+step:477/800 train_loss:4.1939 train_time:196598ms step_avg:420.98ms
+step:478/800 train_loss:3.9940 train_time:197016ms step_avg:420.97ms
+step:479/800 train_loss:4.2100 train_time:197435ms step_avg:420.97ms
+step:480/800 train_loss:4.1850 train_time:197854ms step_avg:420.97ms
+step:481/800 train_loss:4.3180 train_time:198273ms step_avg:420.96ms
+step:482/800 train_loss:4.1306 train_time:198691ms step_avg:420.96ms
+step:483/800 train_loss:3.9385 train_time:199108ms step_avg:420.95ms
+step:484/800 train_loss:4.2170 train_time:199526ms step_avg:420.94ms
+step:485/800 train_loss:4.0663 train_time:199944ms step_avg:420.94ms
+step:486/800 train_loss:4.0843 train_time:200362ms step_avg:420.93ms
+step:487/800 train_loss:4.0248 train_time:200779ms step_avg:420.92ms
+step:488/800 train_loss:4.0716 train_time:201198ms step_avg:420.92ms
+step:489/800 train_loss:4.2737 train_time:201616ms step_avg:420.91ms
+step:490/800 train_loss:4.1177 train_time:202034ms step_avg:420.90ms
+step:491/800 train_loss:4.0189 train_time:202452ms step_avg:420.90ms
+step:492/800 train_loss:4.0208 train_time:202870ms step_avg:420.89ms
+step:493/800 train_loss:4.1398 train_time:203288ms step_avg:420.89ms
+step:494/800 train_loss:3.9856 train_time:203706ms step_avg:420.88ms
+step:495/800 train_loss:4.1301 train_time:204128ms step_avg:420.88ms
+step:496/800 train_loss:4.0525 train_time:204546ms step_avg:420.88ms
+step:497/800 train_loss:3.9599 train_time:204963ms step_avg:420.87ms
+step:498/800 train_loss:4.1325 train_time:205380ms step_avg:420.86ms
+step:499/800 train_loss:4.2210 train_time:205799ms step_avg:420.86ms
+step:500/800 train_loss:4.2527 train_time:206217ms step_avg:420.85ms
+step:500/800 val_loss:4.1139 train_time:206230ms step_avg:420.88ms
+step:501/800 train_loss:4.1547 train_time:206638ms step_avg:420.85ms
+step:502/800 train_loss:4.1948 train_time:207055ms step_avg:420.84ms
+step:503/800 train_loss:4.1421 train_time:207474ms step_avg:420.84ms
+step:504/800 train_loss:4.1759 train_time:207892ms step_avg:420.83ms
+step:505/800 train_loss:4.1401 train_time:208309ms step_avg:420.83ms
+step:506/800 train_loss:4.2315 train_time:208727ms step_avg:420.82ms
+step:507/800 train_loss:4.0229 train_time:209145ms step_avg:420.81ms
+step:508/800 train_loss:4.1581 train_time:209564ms step_avg:420.81ms
+step:509/800 train_loss:4.2390 train_time:209981ms step_avg:420.80ms
+step:510/800 train_loss:4.1773 train_time:210398ms step_avg:420.80ms
+step:511/800 train_loss:3.9872 train_time:210818ms step_avg:420.79ms
+step:512/800 train_loss:4.1868 train_time:211236ms step_avg:420.79ms
+step:513/800 train_loss:4.1123 train_time:211653ms step_avg:420.78ms
+step:514/800 train_loss:4.0856 train_time:212071ms step_avg:420.78ms
+step:515/800 train_loss:4.1425 train_time:212490ms step_avg:420.77ms
+step:516/800 train_loss:4.1461 train_time:212909ms step_avg:420.77ms
+step:517/800 train_loss:4.4781 train_time:213326ms step_avg:420.76ms
+step:518/800 train_loss:4.0631 train_time:213744ms step_avg:420.76ms
+step:519/800 train_loss:4.1961 train_time:214161ms step_avg:420.75ms
+step:520/800 train_loss:4.1207 train_time:214580ms step_avg:420.75ms
+step:521/800 train_loss:4.0891 train_time:214999ms step_avg:420.74ms
+step:522/800 train_loss:4.0231 train_time:215418ms step_avg:420.74ms
+step:523/800 train_loss:4.0444 train_time:215836ms step_avg:420.73ms
+step:524/800 train_loss:4.6660 train_time:216253ms step_avg:420.73ms
+step:525/800 train_loss:4.1477 train_time:216669ms step_avg:420.72ms
+step:526/800 train_loss:4.0941 train_time:217087ms step_avg:420.71ms
+step:527/800 train_loss:4.0891 train_time:217509ms step_avg:420.71ms
+step:528/800 train_loss:4.0476 train_time:217927ms step_avg:420.71ms
+step:529/800 train_loss:4.0206 train_time:218346ms step_avg:420.71ms
+step:530/800 train_loss:4.2213 train_time:218764ms step_avg:420.70ms
+step:531/800 train_loss:4.0372 train_time:219181ms step_avg:420.69ms
+step:532/800 train_loss:4.3168 train_time:219598ms step_avg:420.69ms
+step:533/800 train_loss:4.1172 train_time:220016ms step_avg:420.68ms
+step:534/800 train_loss:4.0490 train_time:220435ms step_avg:420.68ms
+step:535/800 train_loss:4.0773 train_time:220853ms step_avg:420.67ms
+step:536/800 train_loss:4.0083 train_time:221270ms step_avg:420.67ms
+step:537/800 train_loss:4.1216 train_time:221690ms step_avg:420.66ms
+step:538/800 train_loss:4.1166 train_time:222108ms step_avg:420.66ms
+step:539/800 train_loss:4.0287 train_time:222525ms step_avg:420.65ms
+step:540/800 train_loss:4.5224 train_time:222942ms step_avg:420.65ms
+step:541/800 train_loss:4.0565 train_time:223360ms step_avg:420.64ms
+step:542/800 train_loss:4.1681 train_time:223778ms step_avg:420.63ms
+step:543/800 train_loss:4.0071 train_time:224197ms step_avg:420.63ms
+step:544/800 train_loss:3.9850 train_time:224615ms step_avg:420.63ms
+step:545/800 train_loss:4.0765 train_time:225034ms step_avg:420.62ms
+step:546/800 train_loss:3.9951 train_time:225453ms step_avg:420.62ms
+step:547/800 train_loss:4.0432 train_time:225871ms step_avg:420.62ms
+step:548/800 train_loss:4.0489 train_time:226290ms step_avg:420.61ms
+step:549/800 train_loss:4.0238 train_time:226710ms step_avg:420.61ms
+step:550/800 train_loss:4.1090 train_time:227128ms step_avg:420.61ms
+step:551/800 train_loss:3.9832 train_time:227551ms step_avg:420.61ms
+step:552/800 train_loss:4.0126 train_time:227969ms step_avg:420.61ms
+step:553/800 train_loss:4.3344 train_time:228386ms step_avg:420.60ms
+step:554/800 train_loss:4.1321 train_time:228808ms step_avg:420.60ms
+step:555/800 train_loss:4.0978 train_time:229226ms step_avg:420.60ms
+step:556/800 train_loss:4.0661 train_time:229644ms step_avg:420.59ms
+step:557/800 train_loss:4.0748 train_time:230062ms step_avg:420.59ms
+step:558/800 train_loss:3.7549 train_time:230480ms step_avg:420.58ms
+step:559/800 train_loss:3.9936 train_time:230897ms step_avg:420.58ms
+step:560/800 train_loss:4.0350 train_time:231316ms step_avg:420.57ms
+step:561/800 train_loss:4.0784 train_time:231734ms step_avg:420.57ms
+step:562/800 train_loss:3.9902 train_time:232154ms step_avg:420.57ms
+step:563/800 train_loss:3.9352 train_time:232571ms step_avg:420.56ms
+step:564/800 train_loss:4.1381 train_time:232990ms step_avg:420.56ms
+step:565/800 train_loss:3.9553 train_time:233409ms step_avg:420.56ms
+step:566/800 train_loss:4.0762 train_time:233827ms step_avg:420.55ms
+step:567/800 train_loss:4.0326 train_time:234908ms step_avg:421.74ms
+step:568/800 train_loss:3.9739 train_time:235329ms step_avg:421.74ms
+step:569/800 train_loss:4.0678 train_time:235747ms step_avg:421.73ms
+step:570/800 train_loss:4.0390 train_time:236292ms step_avg:421.95ms
+step:571/800 train_loss:4.0595 train_time:236709ms step_avg:421.94ms
+step:572/800 train_loss:4.1593 train_time:237126ms step_avg:421.93ms
+step:573/800 train_loss:4.0821 train_time:237544ms step_avg:421.93ms
+step:574/800 train_loss:4.0871 train_time:237963ms step_avg:421.92ms
+step:575/800 train_loss:4.1539 train_time:238380ms step_avg:421.91ms
+step:576/800 train_loss:4.1112 train_time:238798ms step_avg:421.90ms
+step:577/800 train_loss:4.1182 train_time:239217ms step_avg:421.90ms
+step:578/800 train_loss:4.0754 train_time:239634ms step_avg:421.89ms
+step:579/800 train_loss:4.0359 train_time:240051ms step_avg:421.88ms
+step:580/800 train_loss:4.0274 train_time:240473ms step_avg:421.88ms
+step:581/800 train_loss:3.9826 train_time:240890ms step_avg:421.87ms
+step:582/800 train_loss:4.0132 train_time:241310ms step_avg:421.87ms
+step:583/800 train_loss:4.2365 train_time:241729ms step_avg:421.87ms
+step:584/800 train_loss:4.0063 train_time:242147ms step_avg:421.86ms
+step:585/800 train_loss:3.9659 train_time:242564ms step_avg:421.85ms
+step:586/800 train_loss:4.1478 train_time:242981ms step_avg:421.84ms
+step:587/800 train_loss:3.9070 train_time:243400ms step_avg:421.84ms
+step:588/800 train_loss:4.0352 train_time:243817ms step_avg:421.83ms
+step:589/800 train_loss:4.0507 train_time:244236ms step_avg:421.82ms
+step:590/800 train_loss:4.3835 train_time:244656ms step_avg:421.82ms
+step:591/800 train_loss:4.1550 train_time:245073ms step_avg:421.81ms
+step:592/800 train_loss:3.9023 train_time:245492ms step_avg:421.81ms
+step:593/800 train_loss:3.9108 train_time:245908ms step_avg:421.80ms
+step:594/800 train_loss:3.9199 train_time:246327ms step_avg:421.79ms
+step:595/800 train_loss:3.9482 train_time:246747ms step_avg:421.79ms
+step:596/800 train_loss:4.3126 train_time:247166ms step_avg:421.79ms
+step:597/800 train_loss:4.0276 train_time:247583ms step_avg:421.78ms
+step:598/800 train_loss:3.9699 train_time:248002ms step_avg:421.77ms
+step:599/800 train_loss:4.0292 train_time:248420ms step_avg:421.76ms
+step:600/800 train_loss:3.8527 train_time:248838ms step_avg:421.76ms
+step:601/800 train_loss:3.9742 train_time:249256ms step_avg:421.75ms
+step:602/800 train_loss:4.0023 train_time:249674ms step_avg:421.75ms
+step:603/800 train_loss:4.0163 train_time:250092ms step_avg:421.74ms
+step:604/800 train_loss:4.1525 train_time:250510ms step_avg:421.73ms
+step:605/800 train_loss:4.0286 train_time:250929ms step_avg:421.73ms
+step:606/800 train_loss:3.9955 train_time:251347ms step_avg:421.72ms
+step:607/800 train_loss:3.9186 train_time:251765ms step_avg:421.72ms
+step:608/800 train_loss:4.1667 train_time:252184ms step_avg:421.71ms
+step:609/800 train_loss:4.0113 train_time:252604ms step_avg:421.71ms
+step:610/800 train_loss:3.9907 train_time:253022ms step_avg:421.70ms
+step:611/800 train_loss:4.0982 train_time:253440ms step_avg:421.70ms
+step:612/800 train_loss:4.0038 train_time:253859ms step_avg:421.69ms
+step:613/800 train_loss:3.9729 train_time:254277ms step_avg:421.69ms
+step:614/800 train_loss:4.1404 train_time:254693ms step_avg:421.68ms
+step:615/800 train_loss:4.1068 train_time:255111ms step_avg:421.67ms
+step:616/800 train_loss:4.0727 train_time:255529ms step_avg:421.67ms
+step:617/800 train_loss:3.9838 train_time:255950ms step_avg:421.66ms
+step:618/800 train_loss:3.9425 train_time:256367ms step_avg:421.66ms
+step:619/800 train_loss:4.0460 train_time:256786ms step_avg:421.65ms
+step:620/800 train_loss:3.9516 train_time:257209ms step_avg:421.65ms
+step:621/800 train_loss:3.9648 train_time:257625ms step_avg:421.65ms
+step:622/800 train_loss:4.2581 train_time:258043ms step_avg:421.64ms
+step:623/800 train_loss:3.9707 train_time:258461ms step_avg:421.63ms
+step:624/800 train_loss:4.0002 train_time:258878ms step_avg:421.63ms
+step:625/800 train_loss:4.0732 train_time:259296ms step_avg:421.62ms
+step:625/800 val_loss:4.0020 train_time:259310ms step_avg:421.64ms
+step:626/800 train_loss:4.1041 train_time:259718ms step_avg:421.62ms
+step:627/800 train_loss:4.1198 train_time:260136ms step_avg:421.61ms
+step:628/800 train_loss:4.0964 train_time:260553ms step_avg:421.61ms
+step:629/800 train_loss:4.1481 train_time:260972ms step_avg:421.60ms
+step:630/800 train_loss:3.9570 train_time:261389ms step_avg:421.60ms
+step:631/800 train_loss:4.0927 train_time:261807ms step_avg:421.59ms
+step:632/800 train_loss:4.1316 train_time:262224ms step_avg:421.58ms
+step:633/800 train_loss:4.0306 train_time:262641ms step_avg:421.57ms
+step:634/800 train_loss:3.9464 train_time:263058ms step_avg:421.57ms
+step:635/800 train_loss:4.0486 train_time:263476ms step_avg:421.56ms
+step:636/800 train_loss:4.3082 train_time:263893ms step_avg:421.55ms
+step:637/800 train_loss:3.8991 train_time:264311ms step_avg:421.55ms
+step:638/800 train_loss:3.7301 train_time:264730ms step_avg:421.54ms
+step:639/800 train_loss:3.9516 train_time:265147ms step_avg:421.54ms
+step:640/800 train_loss:3.9812 train_time:265568ms step_avg:421.54ms
+step:641/800 train_loss:3.9538 train_time:265986ms step_avg:421.53ms
+step:642/800 train_loss:3.9541 train_time:266403ms step_avg:421.52ms
+step:643/800 train_loss:3.9931 train_time:266820ms step_avg:421.52ms
+step:644/800 train_loss:4.0157 train_time:267239ms step_avg:421.51ms
+step:645/800 train_loss:3.9357 train_time:267656ms step_avg:421.51ms
+step:646/800 train_loss:4.1568 train_time:268074ms step_avg:421.50ms
+step:647/800 train_loss:4.0402 train_time:268493ms step_avg:421.50ms
+step:648/800 train_loss:4.0465 train_time:268909ms step_avg:421.49ms
+step:649/800 train_loss:4.0540 train_time:269327ms step_avg:421.48ms
+step:650/800 train_loss:4.1271 train_time:269745ms step_avg:421.48ms
+step:651/800 train_loss:3.9889 train_time:270163ms step_avg:421.47ms
+step:652/800 train_loss:4.1266 train_time:270582ms step_avg:421.47ms
+step:653/800 train_loss:3.9542 train_time:271000ms step_avg:421.46ms
+step:654/800 train_loss:4.0314 train_time:271417ms step_avg:421.46ms
+step:655/800 train_loss:3.8013 train_time:271835ms step_avg:421.45ms
+step:656/800 train_loss:3.9509 train_time:272254ms step_avg:421.45ms
+step:657/800 train_loss:3.9538 train_time:272672ms step_avg:421.44ms
+step:658/800 train_loss:3.8949 train_time:273089ms step_avg:421.43ms
+step:659/800 train_loss:4.0727 train_time:273507ms step_avg:421.43ms
+step:660/800 train_loss:3.9646 train_time:273926ms step_avg:421.42ms
+step:661/800 train_loss:4.0446 train_time:274344ms step_avg:421.42ms
+step:662/800 train_loss:4.1227 train_time:274762ms step_avg:421.41ms
+step:663/800 train_loss:4.0330 train_time:275180ms step_avg:421.41ms
+step:664/800 train_loss:3.9176 train_time:275596ms step_avg:421.40ms
+step:665/800 train_loss:3.9969 train_time:276013ms step_avg:421.39ms
+step:666/800 train_loss:3.8646 train_time:276429ms step_avg:421.39ms
+step:667/800 train_loss:4.1646 train_time:276846ms step_avg:421.38ms
+step:668/800 train_loss:3.9941 train_time:277267ms step_avg:421.38ms
+step:669/800 train_loss:3.9894 train_time:277684ms step_avg:421.37ms
+step:670/800 train_loss:3.8507 train_time:278101ms step_avg:421.37ms
+step:671/800 train_loss:3.9615 train_time:278521ms step_avg:421.36ms
+step:672/800 train_loss:3.9180 train_time:278939ms step_avg:421.36ms
+step:673/800 train_loss:3.9503 train_time:279357ms step_avg:421.35ms
+step:674/800 train_loss:4.2319 train_time:279773ms step_avg:421.35ms
+step:675/800 train_loss:4.0186 train_time:280192ms step_avg:421.34ms
+step:676/800 train_loss:4.0818 train_time:280610ms step_avg:421.34ms
+step:677/800 train_loss:3.8539 train_time:281027ms step_avg:421.33ms
+step:678/800 train_loss:3.9570 train_time:281445ms step_avg:421.32ms
+step:679/800 train_loss:3.9070 train_time:281862ms step_avg:421.32ms
+step:680/800 train_loss:4.0510 train_time:282280ms step_avg:421.31ms
+step:681/800 train_loss:3.9524 train_time:282698ms step_avg:421.31ms
+step:682/800 train_loss:3.9847 train_time:283116ms step_avg:421.30ms
+step:683/800 train_loss:4.0587 train_time:283534ms step_avg:421.30ms
+step:684/800 train_loss:4.1028 train_time:283952ms step_avg:421.29ms
+step:685/800 train_loss:3.9977 train_time:284370ms step_avg:421.29ms
+step:686/800 train_loss:4.0762 train_time:284788ms step_avg:421.28ms
+step:687/800 train_loss:4.0027 train_time:285205ms step_avg:421.28ms
+step:688/800 train_loss:4.0503 train_time:285623ms step_avg:421.27ms
+step:689/800 train_loss:3.6816 train_time:286042ms step_avg:421.27ms
+step:690/800 train_loss:3.7910 train_time:286460ms step_avg:421.27ms
+step:691/800 train_loss:3.9202 train_time:286878ms step_avg:421.26ms
+step:692/800 train_loss:3.8098 train_time:287297ms step_avg:421.26ms
+step:693/800 train_loss:4.0255 train_time:287714ms step_avg:421.25ms
+step:694/800 train_loss:4.0423 train_time:288133ms step_avg:421.25ms
+step:695/800 train_loss:3.9286 train_time:288550ms step_avg:421.24ms
+step:696/800 train_loss:3.9121 train_time:288969ms step_avg:421.24ms
+step:697/800 train_loss:4.2102 train_time:289388ms step_avg:421.23ms
+step:698/800 train_loss:3.9802 train_time:289810ms step_avg:421.24ms
+step:699/800 train_loss:4.0052 train_time:290227ms step_avg:421.23ms
+step:700/800 train_loss:4.1782 train_time:290647ms step_avg:421.23ms
+step:701/800 train_loss:3.9462 train_time:291068ms step_avg:421.23ms
+step:702/800 train_loss:3.8962 train_time:291486ms step_avg:421.22ms
+step:703/800 train_loss:3.8944 train_time:291904ms step_avg:421.22ms
+step:704/800 train_loss:3.8403 train_time:292321ms step_avg:421.21ms
+step:705/800 train_loss:3.9356 train_time:292738ms step_avg:421.21ms
+step:706/800 train_loss:3.9227 train_time:293157ms step_avg:421.20ms
+step:707/800 train_loss:3.9480 train_time:293574ms step_avg:421.20ms
+step:708/800 train_loss:4.0170 train_time:293992ms step_avg:421.19ms
+step:709/800 train_loss:3.9550 train_time:294409ms step_avg:421.19ms
+step:710/800 train_loss:3.9373 train_time:294828ms step_avg:421.18ms
+step:711/800 train_loss:3.9155 train_time:295245ms step_avg:421.18ms
+step:712/800 train_loss:3.9560 train_time:295663ms step_avg:421.17ms
+step:713/800 train_loss:4.0172 train_time:296082ms step_avg:421.17ms
+step:714/800 train_loss:4.0267 train_time:296500ms step_avg:421.17ms
+step:715/800 train_loss:3.9391 train_time:296917ms step_avg:421.16ms
+step:716/800 train_loss:3.9433 train_time:297335ms step_avg:421.16ms
+step:717/800 train_loss:3.9647 train_time:297753ms step_avg:421.15ms
+step:718/800 train_loss:4.0980 train_time:298171ms step_avg:421.15ms
+step:719/800 train_loss:3.9695 train_time:298588ms step_avg:421.14ms
+step:720/800 train_loss:4.0296 train_time:299006ms step_avg:421.14ms
+step:721/800 train_loss:4.2013 train_time:299425ms step_avg:421.13ms
+step:722/800 train_loss:3.8315 train_time:299843ms step_avg:421.13ms
+step:723/800 train_loss:4.0874 train_time:300261ms step_avg:421.12ms
+step:724/800 train_loss:4.1466 train_time:300682ms step_avg:421.12ms
+step:725/800 train_loss:3.9194 train_time:301099ms step_avg:421.12ms
+step:726/800 train_loss:4.0155 train_time:301517ms step_avg:421.11ms
+step:727/800 train_loss:3.9183 train_time:301935ms step_avg:421.11ms
+step:728/800 train_loss:3.9164 train_time:302353ms step_avg:421.10ms
+step:729/800 train_loss:4.0919 train_time:302772ms step_avg:421.10ms
+step:730/800 train_loss:4.0541 train_time:303191ms step_avg:421.10ms
+step:731/800 train_loss:4.0555 train_time:303609ms step_avg:421.09ms
+step:732/800 train_loss:3.9346 train_time:304027ms step_avg:421.09ms
+step:733/800 train_loss:3.9584 train_time:304445ms step_avg:421.09ms
+step:734/800 train_loss:4.1948 train_time:304863ms step_avg:421.08ms
+step:735/800 train_loss:3.9130 train_time:305280ms step_avg:421.08ms
+step:736/800 train_loss:3.9926 train_time:305700ms step_avg:421.07ms
+step:737/800 train_loss:4.1173 train_time:306116ms step_avg:421.07ms
+step:738/800 train_loss:4.0186 train_time:306535ms step_avg:421.07ms
+step:739/800 train_loss:3.9678 train_time:306955ms step_avg:421.06ms
+step:740/800 train_loss:3.8693 train_time:307373ms step_avg:421.06ms
+step:741/800 train_loss:4.5186 train_time:307791ms step_avg:421.05ms
+step:742/800 train_loss:3.8739 train_time:308208ms step_avg:421.05ms
+step:743/800 train_loss:3.9598 train_time:308627ms step_avg:421.05ms
+step:744/800 train_loss:3.9486 train_time:309045ms step_avg:421.04ms
+step:745/800 train_loss:4.0077 train_time:309464ms step_avg:421.04ms
+step:746/800 train_loss:3.9940 train_time:309883ms step_avg:421.04ms
+step:747/800 train_loss:3.9673 train_time:310303ms step_avg:421.03ms
+step:748/800 train_loss:4.0014 train_time:310721ms step_avg:421.03ms
+step:749/800 train_loss:3.9224 train_time:311139ms step_avg:421.03ms
+step:750/800 train_loss:3.9363 train_time:311559ms step_avg:421.03ms
+step:750/800 val_loss:3.9441 train_time:311573ms step_avg:421.04ms
+step:751/800 train_loss:3.9822 train_time:311980ms step_avg:421.03ms
+step:752/800 train_loss:3.9295 train_time:312397ms step_avg:421.02ms
+step:753/800 train_loss:3.9654 train_time:312815ms step_avg:421.02ms
+step:754/800 train_loss:3.9854 train_time:313231ms step_avg:421.01ms
+step:755/800 train_loss:3.9529 train_time:313650ms step_avg:421.01ms
+step:756/800 train_loss:4.0422 train_time:314677ms step_avg:421.82ms
+step:757/800 train_loss:3.8790 train_time:315098ms step_avg:421.82ms
+step:758/800 train_loss:4.0952 train_time:315516ms step_avg:421.81ms
+step:759/800 train_loss:4.0085 train_time:315934ms step_avg:421.81ms
+step:760/800 train_loss:3.9425 train_time:316479ms step_avg:421.97ms
+step:761/800 train_loss:4.0416 train_time:316896ms step_avg:421.96ms
+step:762/800 train_loss:3.7678 train_time:317315ms step_avg:421.96ms
+step:763/800 train_loss:3.9393 train_time:317732ms step_avg:421.96ms
+step:764/800 train_loss:4.0404 train_time:318151ms step_avg:421.95ms
+step:765/800 train_loss:3.6842 train_time:318568ms step_avg:421.94ms
+step:766/800 train_loss:4.1307 train_time:318987ms step_avg:421.94ms
+step:767/800 train_loss:3.9810 train_time:319407ms step_avg:421.94ms
+step:768/800 train_loss:3.9230 train_time:319825ms step_avg:421.93ms
+step:769/800 train_loss:3.9478 train_time:320243ms step_avg:421.93ms
+step:770/800 train_loss:3.9742 train_time:320663ms step_avg:421.92ms
+step:771/800 train_loss:4.0308 train_time:321081ms step_avg:421.92ms
+step:772/800 train_loss:4.2550 train_time:321500ms step_avg:421.92ms
+step:773/800 train_loss:3.8234 train_time:321917ms step_avg:421.91ms
+step:774/800 train_loss:4.0402 train_time:322337ms step_avg:421.91ms
+step:775/800 train_loss:4.0127 train_time:322753ms step_avg:421.90ms
+step:776/800 train_loss:3.9731 train_time:323172ms step_avg:421.89ms
+step:777/800 train_loss:3.7886 train_time:323590ms step_avg:421.89ms
+step:778/800 train_loss:3.7882 train_time:324007ms step_avg:421.88ms
+step:779/800 train_loss:3.8443 train_time:324426ms step_avg:421.88ms
+step:780/800 train_loss:3.9324 train_time:324842ms step_avg:421.87ms
+step:781/800 train_loss:3.9773 train_time:325261ms step_avg:421.87ms
+step:782/800 train_loss:4.0350 train_time:325679ms step_avg:421.86ms
+step:783/800 train_loss:3.9315 train_time:326097ms step_avg:421.86ms
+step:784/800 train_loss:3.9660 train_time:326515ms step_avg:421.85ms
+step:785/800 train_loss:3.9389 train_time:326935ms step_avg:421.85ms
+step:786/800 train_loss:3.9321 train_time:327351ms step_avg:421.84ms
+step:787/800 train_loss:3.8389 train_time:327768ms step_avg:421.84ms
+step:788/800 train_loss:4.0930 train_time:328187ms step_avg:421.83ms
+step:789/800 train_loss:3.8794 train_time:328604ms step_avg:421.83ms
+step:790/800 train_loss:3.9511 train_time:329023ms step_avg:421.82ms
+step:791/800 train_loss:4.0076 train_time:329443ms step_avg:421.82ms
+step:792/800 train_loss:4.1383 train_time:329860ms step_avg:421.82ms
+step:793/800 train_loss:4.1441 train_time:330278ms step_avg:421.81ms
+step:794/800 train_loss:3.8853 train_time:330696ms step_avg:421.81ms
+step:795/800 train_loss:3.9808 train_time:331112ms step_avg:421.80ms
+step:796/800 train_loss:4.0211 train_time:331530ms step_avg:421.79ms
+step:797/800 train_loss:4.1346 train_time:331948ms step_avg:421.79ms
+step:798/800 train_loss:3.8939 train_time:332366ms step_avg:421.78ms
+step:799/800 train_loss:4.0431 train_time:332783ms step_avg:421.78ms
+step:800/800 train_loss:3.9481 train_time:333201ms step_avg:421.77ms
+step:800/800 val_loss:3.9358 train_time:333214ms step_avg:421.79ms

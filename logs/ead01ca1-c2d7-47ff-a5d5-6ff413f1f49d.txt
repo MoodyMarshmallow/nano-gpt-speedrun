@@ -1,0 +1,948 @@
+====================================================================================================
+# NOTE: record from https://github.com/KellerJordan/modded-nanogpt/blob/master/records/track_1_short/2024-10-14_ModernArch/dabaaddd-237c-4ec9-939d-6608a9ed5e27.txt
+# ====================================================================================================
+import os
+import sys
+with open(sys.argv[0]) as f:
+    code = f.read() # read the code of this file ASAP, for logging
+import uuid
+import glob
+import time
+import json
+import dataclasses
+import subprocess
+import csv
+from dataclasses import dataclass
+
+import numpy as np
+import torch
+from torch import nn
+import torch.nn.functional as F
+import torch.distributed as dist
+import torch._inductor.config as config
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+# -----------------------------------------------------------------------------
+# Muon optimizer
+
+def zeropower_via_svd(G, steps=None):
+    U, S, V = G.svd()
+    return U @ V.T
+
+@torch.compile
+def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
+    """
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
+    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
+    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
+    zero even beyond the point where the iteration no longer converges all the way to one everywhere
+    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
+    where S' is diagonal with S_{ii}' \\sim Uniform(0.5, 1.5), which turns out not to hurt model
+    performance at all relative to UV^T, where USV^T = G is the SVD.
+    """
+    assert len(G.shape) == 2
+    a, b, c = (3.4445, -4.7750,  2.0315)
+    X = G.bfloat16()
+    X /= (X.norm() + eps) # ensure top singular value <= 1
+    if G.size(0) > G.size(1):
+        X = X.T
+    for _ in range(steps):
+        A = X @ X.T
+        B = A @ X
+        X = a * X + b * B + c * A @ B
+    if G.size(0) > G.size(1):
+        X = X.T
+    return X
+
+zeropower_backends = dict(svd=zeropower_via_svd, newtonschulz5=zeropower_via_newtonschulz5)
+
+class Muon(torch.optim.Optimizer):
+    """
+    Muon - MomentUm Orthogonalized by Newton-schulz
+
+    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
+    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
+    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
+    the advantage that it can be stably run in bfloat16 on the GPU.
+
+    Some warnings:
+    - This optimizer assumes that all parameters passed in are 2D.
+    - It should not be used for the embedding layer, the final fully connected layer, or any {0,1}-D
+    parameters; those should all be optimized by a standard method (e.g., AdamW).
+    - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
+    - We believe it is unlikely to work well for training with small batch size.
+    - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
+    - We have not yet tried this optimizer for training scenarios larger than NanoGPT (124M).
+
+    Arguments:
+        lr: The learning rate used by the internal SGD.
+        momentum: The momentum used by the internal SGD.
+        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
+        backend: The chosen backend for the orthogonalization step. (recommended: 'newtonschulz5')
+        backend_steps: The number of iteration steps to use in the backend, if it is iterative.
+    """
+    def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True, backend='newtonschulz5', backend_steps=5):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
+        super().__init__(params, defaults)
+
+    def step(self):
+        for group in self.param_groups:
+            lr = group['lr']
+            momentum = group['momentum']
+            zeropower_backend = zeropower_backends[group['backend']]
+            for p in group['params']:
+                g = p.grad
+                if g is None:
+                    continue
+                state = self.state[p]
+                if 'momentum_buffer' not in state:
+                    state['momentum_buffer'] = torch.zeros_like(g)
+                buf = state['momentum_buffer']
+                buf.mul_(momentum).add_(g)
+                if group['nesterov']:
+                    g = g.add(buf, alpha=momentum)
+                if g.size(0) == 3 * g.size(1): # split grouped QKV parameters
+                    g = torch.cat([zeropower_backend(g1, steps=group['backend_steps']) for g1 in g.split(g.size(1))])
+                    scale = g.size(1)**0.5
+                else:
+                    g = zeropower_backend(g, steps=group['backend_steps'])
+                    scale = max(g.size(0), g.size(1))**0.5 # scale to have update.square().mean() == 1
+                p.data.add_(g, alpha=-lr * scale)
+
+# -----------------------------------------------------------------------------
+# PyTorch nn.Module definitions for the GPT-2 model
+
+class Rotary(torch.nn.Module):
+
+    def __init__(self, dim, base=10000):
+        super().__init__()
+        self.inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.seq_len_cached = None
+        self.cos_cached = None
+        self.sin_cached = None
+
+    def forward(self, x):
+        seq_len = x.shape[1]
+        if seq_len != self.seq_len_cached:
+            self.seq_len_cached = seq_len
+            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
+            freqs = torch.outer(t, self.inv_freq).to(x.device)
+            self.cos_cached = freqs.cos().bfloat16()
+            self.sin_cached = freqs.sin().bfloat16()
+        return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
+
+def apply_rotary_emb(x, cos, sin):
+    assert x.ndim == 4 # multihead attention
+    d = x.shape[3]//2
+    x1 = x[..., :d]
+    x2 = x[..., d:]
+    y1 = x1 * cos + x2 * sin
+    y2 = x1 * (-sin) + x2 * cos
+    return torch.cat([y1, y2], 3).type_as(x)
+
+def _apply_gate_act(logits: torch.Tensor, kind: str) -> torch.Tensor:
+    if kind == "sigmoid":
+        return torch.sigmoid(logits)
+    if kind == "ns_sigmoid":
+        return 0.5 + 0.5 * torch.sigmoid(logits)
+    raise ValueError(f"unknown gate_act={kind}")
+
+class CausalSelfAttention(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.head_dim = self.n_embd // self.n_head
+        assert self.n_embd % self.n_head == 0
+        self.attn_gate = getattr(config, "attn_gate", "none")
+        self.gate_pos = getattr(config, "gate_pos", "sdpa")
+        self.gate_act = getattr(config, "gate_act", "sigmoid")
+        self.c_q = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_k = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_v = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        # output projection
+        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+        self.rotary = Rotary(self.head_dim)
+        if self.attn_gate == "headwise":
+            self.c_gate = nn.Linear(self.n_embd, self.n_head, bias=False)
+            self.gate_param = None
+        elif self.attn_gate == "elementwise":
+            self.c_gate = nn.Linear(self.n_embd, self.n_embd, bias=False)
+            self.gate_param = None
+        elif self.attn_gate == "const":
+            self.c_gate = None
+            self.gate_param = nn.Parameter(torch.zeros(self.n_head, self.head_dim))
+        else:
+            self.c_gate = None
+            self.gate_param = None
+
+    def forward(self, x):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+        k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
+        if self.attn_gate != "none" and self.gate_pos == "value":
+            if self.attn_gate == "const":
+                gate = _apply_gate_act(self.gate_param, self.gate_act)[None, None, :, :]
+            else:
+                gate_logits = self.c_gate(x)
+                gate = _apply_gate_act(gate_logits, self.gate_act)
+                if self.attn_gate == "headwise":
+                    gate = gate.view(B, T, self.n_head, 1)
+                else:
+                    gate = gate.view(B, T, self.n_head, self.head_dim)
+            v = v * gate
+        cos, sin = self.rotary(q)
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
+        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
+        y = y.transpose(1, 2) # (B, T, n_head, head_dim)
+        if self.attn_gate != "none" and self.gate_pos == "sdpa":
+            if self.attn_gate == "const":
+                gate = _apply_gate_act(self.gate_param, self.gate_act)[None, None, :, :]
+            else:
+                gate_logits = self.c_gate(x)
+                gate = _apply_gate_act(gate_logits, self.gate_act)
+                if self.attn_gate == "headwise":
+                    gate = gate.view(B, T, self.n_head, 1)
+                else:
+                    gate = gate.view(B, T, self.n_head, self.head_dim)
+            y = y * gate
+        y = y.contiguous().view_as(x) # re-assemble all head outputs side by side
+        y = self.c_proj(y)
+        return y
+
+class MLP(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+        x = self.c_proj(x)
+        return x
+
+class Block(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.attn = CausalSelfAttention(config)
+        self.mlp = MLP(config)
+
+    def forward(self, x):
+        x = x + self.attn(F.rms_norm(x, (x.size(-1),)))
+        x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
+        return x
+
+# -----------------------------------------------------------------------------
+# The main GPT-2 model
+
+@dataclass
+class GPTConfig:
+    vocab_size : int = 50304
+    n_layer : int = 12
+    n_head : int = 6 # head dim 128 suggested by @Grad62304977
+    n_embd : int = 768
+    attn_gate : str = "none"
+    gate_pos : str = "sdpa"
+    gate_act : str = "sigmoid"
+
+class GPT(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+        ))
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+
+    def forward(self, idx, targets=None, return_logits=True):
+
+        # forward the GPT model itself
+        x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        for block in self.transformer.h:
+            x = block(x)
+        x = F.rms_norm(x, (x.size(-1),))
+
+        if targets is not None:
+            # if we are given some desired targets also calculate the loss
+            logits = self.lm_head(x)
+            logits = logits.float() # use tf32/fp32 for logits
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        else:
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = logits.float() # use tf32/fp32 for logits
+            loss = None
+
+        # there are performance reasons why not returning logits is prudent, if not needed
+        if not return_logits:
+            logits = None
+
+        return logits, loss
+
+# -----------------------------------------------------------------------------
+# Our own simple Distributed Data Loader
+
+def _peek_data_shard(filename):
+    # only reads the header, returns header data
+    with open(filename, "rb") as f:
+        # first read the header, which is 256 int32 integers (4 bytes each)
+        header = np.frombuffer(f.read(256*4), dtype=np.int32)
+    if header[0] != 20240520:
+        print("ERROR: magic number mismatch in the data .bin file!")
+        print("---> HINT: Are you passing in a correct file with --input_bin?")
+        print("---> HINT: Dataset encoding changed recently, re-run data prepro or refer again to README")
+        print("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
+        exit(1)
+    assert header[1] == 1, "unsupported version"
+    ntok = header[2] # number of tokens (claimed)
+    return ntok # for now just return the number of tokens
+
+def _load_data_shard(filename):
+    with open(filename, "rb") as f:
+        # first read the header, which is 256 int32 integers (4 bytes each)
+        header = np.frombuffer(f.read(256*4), dtype=np.int32)
+        assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+        assert header[1] == 1, "unsupported version"
+        ntok = header[2] # number of tokens (claimed)
+        # the rest of it are tokens, stored as uint16
+        tokens = np.frombuffer(f.read(), dtype=np.uint16)
+    assert len(tokens) == ntok, "number of tokens read does not match header?"
+    return tokens
+
+class DistributedDataLoader:
+    def __init__(self, filename_pattern, B, T, process_rank, num_processes):
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        self.B = B
+        self.T = T
+
+        # glob files that match the pattern
+        self.files = sorted(glob.glob(filename_pattern))
+        assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
+
+        # load and validate all data shards, count number of tokens in total
+        ntok_total = 0
+        for fname in self.files:
+            shard_ntok = _peek_data_shard(fname)
+            assert shard_ntok >= num_processes * B * T + 1
+            ntok_total += int(shard_ntok)
+        self.ntok_total = ntok_total
+
+        # kick things off
+        self.reset()
+
+    def reset(self):
+        self.current_shard = 0
+        self.current_position = self.process_rank * self.B * self.T
+        self.tokens = _load_data_shard(self.files[self.current_shard])
+
+    def advance(self): # advance to next data shard
+        self.current_shard = (self.current_shard + 1) % len(self.files)
+        self.current_position = self.process_rank * self.B * self.T
+        self.tokens = _load_data_shard(self.files[self.current_shard])
+
+    def next_batch(self):
+        B = self.B
+        T = self.T
+        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
+        x = (buf[:-1]).view(B, T) # inputs
+        y = (buf[1:]).view(B, T) # targets
+        # advance current position and load next shard if necessary
+        self.current_position += B * T * self.num_processes
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.advance()
+        return x.cuda(), y.cuda()
+
+# -----------------------------------------------------------------------------
+# int main
+
+@dataclass
+class Hyperparameters:
+    # data hyperparams
+    input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
+    input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
+    # optimization hyperparams
+    batch_size : int = 8*64 # batch size, in sequences, across all devices
+    device_batch_size : int = 64 # batch size, in sequences, per device
+    sequence_length : int = 1024 # sequence length, in tokens
+    num_iterations : int = 5100 # number of iterations to run
+    learning_rate : float = 0.0036
+    warmup_iters : int = 0
+    warmdown_iters : int = 1450 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
+    weight_decay : float = 0
+    seed : int = 1337
+    attn_gate : str = "none" # none|headwise|elementwise|const
+    gate_pos : str = "sdpa" # sdpa|value
+    gate_act : str = "sigmoid" # sigmoid|ns_sigmoid
+    early_stop_patience : int = 0 # 0 disables early stopping
+    early_stop_min_delta : float = 0.0
+    # evaluation and logging hyperparams
+    val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
+args = Hyperparameters()
+
+def apply_env_overrides():
+    # environment-variable overrides allow quick sweeps without editing code
+    args.learning_rate = float(os.environ.get("LR", args.learning_rate))
+    args.seed = int(os.environ.get("SEED", args.seed))
+    args.warmup_iters = int(os.environ.get("WARMUP_ITERS", args.warmup_iters))
+    args.num_iterations = int(os.environ.get("NUM_ITERATIONS", args.num_iterations))
+    args.early_stop_patience = int(os.environ.get("EARLY_STOP_PATIENCE", args.early_stop_patience))
+    args.early_stop_min_delta = float(os.environ.get("EARLY_STOP_MIN_DELTA", args.early_stop_min_delta))
+    args.attn_gate = os.environ.get("ATTNGATE", args.attn_gate)
+    args.gate_pos = os.environ.get("GATEPOS", args.gate_pos)
+    args.gate_act = os.environ.get("GATEACT", args.gate_act)
+    args.num_iterations = int(os.environ.get("NUM_ITER", args.num_iterations))
+    args.val_loss_every = int(os.environ.get("VAL_EVERY", args.val_loss_every))
+
+def get_git_commit():
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    except Exception:
+        return "unknown"
+
+apply_env_overrides()
+torch.manual_seed(args.seed)
+torch.cuda.manual_seed_all(args.seed)
+np.random.seed(args.seed)
+
+# set up DDP (distributed data parallel). torchrun sets this env variable
+assert torch.cuda.is_available()
+dist.init_process_group(backend='nccl')
+ddp_rank = int(os.environ['RANK'])
+ddp_local_rank = int(os.environ['LOCAL_RANK'])
+ddp_world_size = int(os.environ['WORLD_SIZE'])
+device = f'cuda:{ddp_local_rank}'
+torch.cuda.set_device(device)
+print(f"using device: {device}")
+master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
+git_commit = get_git_commit() if master_process else "unknown"
+
+# convenience variables
+B, T = args.device_batch_size, args.sequence_length
+# calculate the number of steps to take in the val loop.
+assert args.val_tokens % (B * T * ddp_world_size) == 0
+val_steps = args.val_tokens // (B * T * ddp_world_size)
+# calculate the steps of gradient accumulation required to attain the desired global batch size.
+assert args.batch_size % (B * ddp_world_size) == 0
+train_accumulation_steps = args.batch_size // (B * ddp_world_size)
+
+# load tokens
+train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
+val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+if master_process:
+    print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
+    print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
+x, y = train_loader.next_batch()
+
+# there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
+# this originates from Karpathy's experiments.
+num_vocab = 50304
+model = GPT(GPTConfig(
+    vocab_size=num_vocab,
+    n_layer=12,
+    n_head=6,
+    n_embd=768,
+    attn_gate=args.attn_gate,
+    gate_pos=args.gate_pos,
+    gate_act=args.gate_act,
+))
+model = model.cuda()
+if hasattr(config, "coordinate_descent_tuning"):
+    config.coordinate_descent_tuning = True # suggested by @Chillee
+model = torch.compile(model)
+# here we wrap model into DDP container
+model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module # always contains the "raw" unwrapped model
+ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
+
+# init the optimizer(s)
+optimizer1 = torch.optim.AdamW(raw_model.lm_head.parameters(), lr=args.learning_rate, betas=(0.9, 0.95),
+                               weight_decay=args.weight_decay, fused=True)
+optimizer2 = Muon(raw_model.transformer.h.parameters(), lr=0.1*args.learning_rate, momentum=0.95)
+optimizers = [optimizer1, optimizer2]
+# learning rate decay scheduler (linear warmup and warmdown)
+def get_lr(it):
+    assert it <= args.num_iterations
+    # 1) linear warmup for warmup_iters steps
+    if it < args.warmup_iters:
+        return (it+1) / args.warmup_iters
+    # 2) constant lr for a while
+    elif it < args.num_iterations - args.warmdown_iters:
+        return 1.0
+    # 3) linear warmdown
+    else:
+        decay_ratio = (args.num_iterations - it) / args.warmdown_iters
+        return decay_ratio
+schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
+
+# begin logging
+if master_process:
+    run_id = str(uuid.uuid4())
+    logdir = 'logs/%s/' % run_id
+    os.makedirs(logdir, exist_ok=True)
+    logfile = 'logs/%s.txt' % run_id
+    # create the log file
+    with open(logfile, "w") as f:
+        # begin the log by printing this file (the Python code)
+        f.write('='*100 + '\n')
+        f.write(code)
+        f.write('='*100 + '\n')
+        f.write(f"git_commit: {git_commit}\n")
+        f.write(f"seed: {args.seed}\n")
+        f.write("hyperparameters:\n")
+        f.write(json.dumps(dataclasses.asdict(args), indent=2))
+        f.write("\n")
+        # log information about the hardware/software environment this is running on
+        # and print the full `nvidia-smi` to file
+        f.write(f"Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:\n")
+        result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        f.write(f'{result.stdout}\n')
+        f.write('='*100 + '\n')
+
+training_time_ms = 0
+best_val_loss = float("inf")
+final_val_loss = None
+no_improve_count = 0
+early_stop_reason = None
+# start the clock
+torch.cuda.synchronize()
+t0 = time.time()
+# begin training
+train_loader.reset()
+for step in range(args.num_iterations + 1):
+    last_step = (step == args.num_iterations)
+    # This effectively ignores timing first 10 steps, which are slower for weird reasons.
+    # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
+    # steps with dummy data first, and then re-initialize the model and reset the loader.
+    if step == 10:
+        training_time_ms = 0
+        t0 = time.time()
+    timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
+
+    # once in a while evaluate the validation dataset
+    if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
+        # stop the clock
+        torch.cuda.synchronize()
+        training_time_ms += 1000 * (time.time() - t0)
+        # run validation batches
+        model.eval()
+        val_loader.reset()
+        val_loss = 0.0
+        for _ in range(val_steps):
+            x_val, y_val = val_loader.next_batch()
+            with ctx: # of course, we'd like to use no_grad() here too, but that creates a torch.compile error for some reason
+                _, loss = model(x_val, y_val, return_logits=False)
+                val_loss += loss.detach()
+                del loss
+        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+        val_loss /= val_steps
+        if not torch.isfinite(val_loss):
+            early_stop_reason = "non-finite val_loss"
+            final_val_loss = float("nan")
+            val_loss_item = float("nan")
+        else:
+            val_loss_item = val_loss.item()
+            final_val_loss = val_loss_item
+            if val_loss_item < best_val_loss - args.early_stop_min_delta:
+                best_val_loss = val_loss_item
+                no_improve_count = 0
+            else:
+                no_improve_count += 1
+        # log val loss to console and to logfile
+        if master_process:
+            print(f'step:{step}/{args.num_iterations} val_loss:{val_loss_item:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
+            with open(logfile, "a") as f:
+                f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss_item:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
+            if early_stop_reason is None and args.early_stop_patience > 0 and no_improve_count >= args.early_stop_patience:
+                early_stop_reason = f"early_stop patience={args.early_stop_patience} min_delta={args.early_stop_min_delta}"
+        # start the clock again
+        torch.cuda.synchronize()
+        t0 = time.time()
+
+    if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
+        # stop the clock
+        torch.cuda.synchronize()
+        training_time_ms += 1000 * (time.time() - t0)
+        # save the state of the training process in a subdir to keep logs tidy
+        ckpt_dir = os.path.join(logdir, "checkpoints")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
+        torch.save(log, os.path.join(ckpt_dir, f"state_step{step:06d}.pt"))
+        # start the clock again
+        torch.cuda.synchronize()
+        t0 = time.time()
+
+    # bit confusing: we want to make sure to eval on 0th iteration
+    # but also after the very last iteration. so we loop for step <= num_iterations
+    # instead of just < num_iterations (one extra due to <=), only to do
+    # the validation/sampling one last time, and then we break right here as we're done.
+    if last_step:
+        break
+
+    # --------------- TRAINING SECTION BEGIN -----------------
+    model.train()
+    for i in range(1, train_accumulation_steps+1):
+        # forward pass
+        with ctx:
+            _, loss = model(x, y, return_logits=False)
+            train_loss = loss.detach()
+        # advance the dataset for the next batch
+        x, y = train_loader.next_batch()
+        # backward pass
+        if i < train_accumulation_steps:
+            with model.no_sync(): # there's no need to sync gradients every accumulation step
+                loss.backward()
+        else:
+            loss.backward() # just sync on the last step
+    for p in model.parameters():
+        p.grad /= train_accumulation_steps
+    # step the optimizers and schedulers
+    for opt, sched in zip(optimizers, schedulers):
+        opt.step()
+        sched.step()
+    # null the gradients
+    model.zero_grad(set_to_none=True)
+    # --------------- TRAINING SECTION END -------------------
+    # everything that follows now is just diagnostics, prints, logging, etc.
+
+    #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
+    if master_process:
+        approx_time = training_time_ms + 1000 * (time.time() - t0)
+        print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+        with open(logfile, "a") as f:
+            f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
+    if early_stop_reason is not None:
+        break
+
+if master_process:
+    if early_stop_reason is not None:
+        print(f"stopped early: {early_stop_reason}")
+    print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+    timed_steps_final = max(args.num_iterations - 9, 1)
+    ms_per_step = training_time_ms / timed_steps_final
+    os.makedirs("experiments", exist_ok=True)
+    results_path = os.path.join("experiments", "results.csv")
+    fieldnames = [
+        "run_id",
+        "date",
+        "git_commit",
+        "seed",
+        "attn_gate",
+        "gate_pos",
+        "gate_act",
+        "learning_rate",
+        "batch_size",
+        "device_batch_size",
+        "sequence_length",
+        "num_iterations",
+        "warmdown_iters",
+        "final_val_loss",
+        "best_val_loss",
+        "train_time_ms",
+        "ms_per_step",
+        "gpu_name",
+        "n_gpus",
+        "runpod_instance",
+        "notes",
+    ]
+    final_loss_value = final_val_loss if final_val_loss is not None else float("nan")
+    best_loss_value = best_val_loss if best_val_loss < float("inf") else float("nan")
+    row = {
+        "run_id": run_id,
+        "date": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
+        "git_commit": git_commit,
+        "seed": args.seed,
+        "attn_gate": args.attn_gate,
+        "gate_pos": args.gate_pos,
+        "gate_act": args.gate_act,
+        "learning_rate": args.learning_rate,
+        "batch_size": args.batch_size,
+        "device_batch_size": args.device_batch_size,
+        "sequence_length": args.sequence_length,
+        "num_iterations": args.num_iterations,
+        "warmdown_iters": args.warmdown_iters,
+        "final_val_loss": final_loss_value,
+        "best_val_loss": best_loss_value,
+        "train_time_ms": training_time_ms,
+        "ms_per_step": ms_per_step,
+        "gpu_name": torch.cuda.get_device_name(ddp_local_rank),
+        "n_gpus": ddp_world_size,
+        "runpod_instance": os.environ.get("RUNPOD_INSTANCE_TYPE", "unknown"),
+        "notes": "",
+    }
+    write_header = not os.path.exists(results_path)
+    with open(results_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+====================================================================================================
+git_commit: f6ab6337f015534fba9b180efa73021bb4db2247
+seed: 1337
+hyperparameters:
+{
+  "input_bin": "data/fineweb10B/fineweb_train_*.bin",
+  "input_val_bin": "data/fineweb10B/fineweb_val_*.bin",
+  "batch_size": 512,
+  "device_batch_size": 64,
+  "sequence_length": 1024,
+  "num_iterations": 800,
+  "learning_rate": 0.0036,
+  "warmup_iters": 150,
+  "warmdown_iters": 1450,
+  "weight_decay": 0,
+  "seed": 1337,
+  "attn_gate": "none",
+  "gate_pos": "sdpa",
+  "gate_act": "sigmoid",
+  "early_stop_patience": 50,
+  "early_stop_min_delta": 0.0,
+  "val_loss_every": 125,
+  "val_tokens": 10485760,
+  "save_every": 0
+}
+Running pytorch 2.8.0+cu128 compiled for CUDA 12.8
+nvidia-smi:
+Sun Dec  7 15:53:47 2025       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 575.57.08              Driver Version: 575.57.08      CUDA Version: 12.9     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA A100 80GB PCIe          On  |   00000000:00:07.0 Off |                    0 |
+| N/A   32C    P0            113W /  300W |    2409MiB /  81920MiB |     10%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA A100 80GB PCIe          On  |   00000000:00:08.0 Off |                    0 |
+| N/A   37C    P0             60W /  300W |       4MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA A100 80GB PCIe          On  |   00000000:00:09.0 Off |                    0 |
+| N/A   25C    P0             55W /  300W |       4MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA A100 80GB PCIe          On  |   00000000:00:0A.0 Off |                    0 |
+| N/A   26C    P0             55W /  300W |       4MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   4  NVIDIA A100 80GB PCIe          On  |   00000000:00:0B.0 Off |                    0 |
+| N/A   28C    P0             57W /  300W |       4MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   5  NVIDIA A100 80GB PCIe          On  |   00000000:00:0C.0 Off |                    0 |
+| N/A   26C    P0             55W /  300W |       4MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   6  NVIDIA A100 80GB PCIe          On  |   00000000:00:0D.0 Off |                    0 |
+| N/A   32C    P0             59W /  300W |       4MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   7  NVIDIA A100 80GB PCIe          On  |   00000000:00:0E.0 Off |                    0 |
+| N/A   29C    P0             56W /  300W |       4MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
++-----------------------------------------------------------------------------------------+
+
+====================================================================================================
+step:0/800 val_loss:16.0297 train_time:235ms step_avg:nanms
+step:1/800 train_loss:16.0328 train_time:77638ms step_avg:nanms
+step:2/800 train_loss:15.9355 train_time:83614ms step_avg:nanms
+step:3/800 train_loss:15.6413 train_time:89653ms step_avg:nanms
+step:4/800 train_loss:15.0770 train_time:95686ms step_avg:nanms
+step:5/800 train_loss:13.9559 train_time:101722ms step_avg:nanms
+step:6/800 train_loss:12.3177 train_time:107764ms step_avg:nanms
+step:7/800 train_loss:10.7462 train_time:113803ms step_avg:nanms
+step:8/800 train_loss:9.8206 train_time:119869ms step_avg:nanms
+step:9/800 train_loss:9.4976 train_time:125928ms step_avg:nanms
+step:10/800 train_loss:9.3625 train_time:131973ms step_avg:nanms
+step:11/800 train_loss:9.2203 train_time:6035ms step_avg:nanms
+step:12/800 train_loss:9.1185 train_time:12102ms step_avg:nanms
+step:13/800 train_loss:8.9657 train_time:18141ms step_avg:6047.08ms
+step:14/800 train_loss:8.6922 train_time:24196ms step_avg:6048.88ms
+step:15/800 train_loss:8.6096 train_time:30248ms step_avg:6049.67ms
+step:16/800 train_loss:8.4313 train_time:36297ms step_avg:6049.53ms
+step:17/800 train_loss:8.2404 train_time:42347ms step_avg:6049.58ms
+step:18/800 train_loss:8.0491 train_time:48393ms step_avg:6049.11ms
+step:19/800 train_loss:7.8538 train_time:54208ms step_avg:6023.12ms
+step:20/800 train_loss:7.7971 train_time:60282ms step_avg:6028.15ms
+step:21/800 train_loss:7.7099 train_time:66325ms step_avg:6029.52ms
+step:22/800 train_loss:7.5315 train_time:72382ms step_avg:6031.81ms
+step:23/800 train_loss:7.3235 train_time:77959ms step_avg:5996.88ms
+step:24/800 train_loss:7.2300 train_time:84016ms step_avg:6001.14ms
+step:25/800 train_loss:7.2773 train_time:90066ms step_avg:6004.38ms
+step:26/800 train_loss:7.2755 train_time:96126ms step_avg:6007.90ms
+step:27/800 train_loss:7.3650 train_time:102182ms step_avg:6010.69ms
+step:28/800 train_loss:7.2857 train_time:108230ms step_avg:6012.78ms
+step:29/800 train_loss:7.1755 train_time:114295ms step_avg:6015.50ms
+step:30/800 train_loss:7.1236 train_time:120309ms step_avg:6015.43ms
+step:31/800 train_loss:7.0991 train_time:126355ms step_avg:6016.90ms
+step:32/800 train_loss:7.1729 train_time:132421ms step_avg:6019.13ms
+step:33/800 train_loss:7.0316 train_time:138492ms step_avg:6021.40ms
+step:34/800 train_loss:6.9438 train_time:144551ms step_avg:6022.97ms
+step:35/800 train_loss:6.8574 train_time:150596ms step_avg:6023.84ms
+step:36/800 train_loss:6.9139 train_time:156666ms step_avg:6025.60ms
+step:37/800 train_loss:6.5604 train_time:162750ms step_avg:6027.76ms
+step:38/800 train_loss:6.9906 train_time:168817ms step_avg:6029.18ms
+step:39/800 train_loss:6.8426 train_time:174678ms step_avg:6023.37ms
+step:40/800 train_loss:6.8369 train_time:180754ms step_avg:6025.14ms
+step:41/800 train_loss:6.6255 train_time:186824ms step_avg:6026.58ms
+step:42/800 train_loss:6.8442 train_time:192889ms step_avg:6027.78ms
+step:43/800 train_loss:6.6886 train_time:198946ms step_avg:6028.67ms
+step:44/800 train_loss:6.5728 train_time:205021ms step_avg:6030.04ms
+step:45/800 train_loss:6.5326 train_time:211087ms step_avg:6031.05ms
+step:46/800 train_loss:6.6425 train_time:217150ms step_avg:6031.94ms
+step:47/800 train_loss:6.6634 train_time:223207ms step_avg:6032.62ms
+step:48/800 train_loss:6.4711 train_time:229278ms step_avg:6033.63ms
+step:49/800 train_loss:6.4964 train_time:235341ms step_avg:6034.39ms
+step:50/800 train_loss:6.4752 train_time:241399ms step_avg:6034.98ms
+step:51/800 train_loss:6.4953 train_time:247474ms step_avg:6035.94ms
+step:52/800 train_loss:6.5201 train_time:253547ms step_avg:6036.83ms
+step:53/800 train_loss:6.6468 train_time:259611ms step_avg:6037.46ms
+step:54/800 train_loss:6.2724 train_time:265679ms step_avg:6038.16ms
+step:55/800 train_loss:6.3924 train_time:271751ms step_avg:6038.91ms
+step:56/800 train_loss:6.3870 train_time:277829ms step_avg:6039.76ms
+step:57/800 train_loss:6.4278 train_time:283894ms step_avg:6040.30ms
+step:58/800 train_loss:6.2425 train_time:289752ms step_avg:6036.51ms
+step:59/800 train_loss:6.3764 train_time:295778ms step_avg:6036.29ms
+step:60/800 train_loss:6.4282 train_time:301862ms step_avg:6037.24ms
+step:61/800 train_loss:6.3715 train_time:307925ms step_avg:6037.75ms
+step:62/800 train_loss:6.4841 train_time:313999ms step_avg:6038.44ms
+step:63/800 train_loss:6.3466 train_time:320073ms step_avg:6039.11ms
+step:64/800 train_loss:6.4049 train_time:326150ms step_avg:6039.82ms
+step:65/800 train_loss:6.2449 train_time:332212ms step_avg:6040.21ms
+step:66/800 train_loss:6.3552 train_time:338288ms step_avg:6040.86ms
+step:67/800 train_loss:6.3081 train_time:344356ms step_avg:6041.33ms
+step:68/800 train_loss:6.4023 train_time:350429ms step_avg:6041.87ms
+step:69/800 train_loss:6.2192 train_time:356512ms step_avg:6042.57ms
+step:70/800 train_loss:6.3065 train_time:362568ms step_avg:6042.79ms
+step:71/800 train_loss:6.4269 train_time:368638ms step_avg:6043.24ms
+step:72/800 train_loss:6.1461 train_time:374704ms step_avg:6043.62ms
+step:73/800 train_loss:6.2269 train_time:380766ms step_avg:6043.91ms
+step:74/800 train_loss:6.2290 train_time:386850ms step_avg:6044.53ms
+step:75/800 train_loss:6.1466 train_time:392918ms step_avg:6044.89ms
+step:76/800 train_loss:6.1255 train_time:398993ms step_avg:6045.36ms
+step:77/800 train_loss:6.1108 train_time:404855ms step_avg:6042.61ms
+step:78/800 train_loss:6.1784 train_time:410935ms step_avg:6043.17ms
+step:79/800 train_loss:6.0747 train_time:417002ms step_avg:6043.50ms
+step:80/800 train_loss:6.0765 train_time:423060ms step_avg:6043.72ms
+step:81/800 train_loss:6.0715 train_time:429127ms step_avg:6044.05ms
+step:82/800 train_loss:6.6806 train_time:435207ms step_avg:6044.54ms
+step:83/800 train_loss:6.0995 train_time:441278ms step_avg:6044.90ms
+step:84/800 train_loss:6.0752 train_time:447353ms step_avg:6045.32ms
+step:85/800 train_loss:6.0482 train_time:453418ms step_avg:6045.58ms
+step:86/800 train_loss:6.0141 train_time:459480ms step_avg:6045.79ms
+step:87/800 train_loss:6.0013 train_time:465498ms step_avg:6045.42ms
+step:88/800 train_loss:5.8826 train_time:471575ms step_avg:6045.84ms
+step:89/800 train_loss:5.6166 train_time:477650ms step_avg:6046.20ms
+step:90/800 train_loss:5.8939 train_time:483723ms step_avg:6046.54ms
+step:91/800 train_loss:5.9236 train_time:489797ms step_avg:6046.88ms
+step:92/800 train_loss:6.0400 train_time:495870ms step_avg:6047.20ms
+step:93/800 train_loss:5.8554 train_time:501940ms step_avg:6047.46ms
+step:94/800 train_loss:5.8462 train_time:508013ms step_avg:6047.78ms
+step:95/800 train_loss:6.0176 train_time:514079ms step_avg:6047.99ms
+step:96/800 train_loss:5.7995 train_time:519934ms step_avg:6045.74ms
+step:97/800 train_loss:5.8393 train_time:526004ms step_avg:6046.03ms
+step:98/800 train_loss:5.8022 train_time:532074ms step_avg:6046.30ms
+step:99/800 train_loss:5.8803 train_time:538141ms step_avg:6046.53ms
+step:100/800 train_loss:5.6050 train_time:544215ms step_avg:6046.83ms
+step:101/800 train_loss:5.8871 train_time:550266ms step_avg:6046.87ms
+step:102/800 train_loss:5.8557 train_time:556327ms step_avg:6047.03ms
+step:103/800 train_loss:5.8600 train_time:562406ms step_avg:6047.38ms
+step:104/800 train_loss:5.6200 train_time:568455ms step_avg:6047.39ms
+step:105/800 train_loss:5.7158 train_time:574536ms step_avg:6047.74ms
+step:106/800 train_loss:5.7774 train_time:580601ms step_avg:6047.93ms
+step:107/800 train_loss:5.8271 train_time:586663ms step_avg:6048.07ms
+step:108/800 train_loss:5.7818 train_time:592729ms step_avg:6048.26ms
+step:109/800 train_loss:5.6672 train_time:598787ms step_avg:6048.35ms
+step:110/800 train_loss:5.8515 train_time:604871ms step_avg:6048.71ms
+step:111/800 train_loss:5.6968 train_time:610949ms step_avg:6049.00ms
+step:112/800 train_loss:5.6885 train_time:617018ms step_avg:6049.20ms
+step:113/800 train_loss:5.8736 train_time:623075ms step_avg:6049.27ms
+step:114/800 train_loss:5.6294 train_time:629128ms step_avg:6049.30ms
+step:115/800 train_loss:5.5495 train_time:634982ms step_avg:6047.45ms
+step:116/800 train_loss:5.6362 train_time:640976ms step_avg:6046.94ms
+step:117/800 train_loss:5.6353 train_time:647046ms step_avg:6047.16ms
+step:118/800 train_loss:5.5224 train_time:653117ms step_avg:6047.38ms
+step:119/800 train_loss:5.6593 train_time:659178ms step_avg:6047.51ms
+step:120/800 train_loss:5.5969 train_time:665244ms step_avg:6047.67ms
+step:121/800 train_loss:5.6654 train_time:671292ms step_avg:6047.68ms
+step:122/800 train_loss:5.3933 train_time:677351ms step_avg:6047.77ms
+step:123/800 train_loss:5.5942 train_time:683190ms step_avg:6045.93ms
+step:124/800 train_loss:5.5398 train_time:686763ms step_avg:6024.23ms
+step:125/800 train_loss:5.5057 train_time:689551ms step_avg:5996.10ms
+step:125/800 val_loss:5.5297 train_time:689567ms step_avg:5996.24ms
+step:126/800 train_loss:5.4994 train_time:692346ms step_avg:5968.50ms
+step:127/800 train_loss:5.7197 train_time:695151ms step_avg:5941.46ms
+step:128/800 train_loss:5.5466 train_time:697940ms step_avg:5914.75ms
+step:129/800 train_loss:5.4330 train_time:700775ms step_avg:5888.87ms
+step:130/800 train_loss:5.3531 train_time:703609ms step_avg:5863.41ms
+step:131/800 train_loss:5.6950 train_time:708052ms step_avg:5851.67ms
+step:132/800 train_loss:5.4371 train_time:713236ms step_avg:5846.20ms
+step:133/800 train_loss:5.4478 train_time:718549ms step_avg:5841.86ms
+step:134/800 train_loss:5.5549 train_time:723896ms step_avg:5837.87ms
+step:135/800 train_loss:5.3283 train_time:727350ms step_avg:5818.80ms
+step:136/800 train_loss:5.4560 train_time:730188ms step_avg:5795.14ms
+step:137/800 train_loss:5.3436 train_time:733632ms step_avg:5776.63ms
+step:138/800 train_loss:5.3757 train_time:738733ms step_avg:5771.35ms
+step:139/800 train_loss:5.4268 train_time:743797ms step_avg:5765.87ms
+step:140/800 train_loss:5.5208 train_time:748977ms step_avg:5761.36ms
+step:141/800 train_loss:5.4737 train_time:754126ms step_avg:5756.69ms
+step:142/800 train_loss:5.4488 train_time:759040ms step_avg:5750.30ms
+step:143/800 train_loss:5.4362 train_time:764524ms step_avg:5748.30ms
+step:144/800 train_loss:5.2629 train_time:767309ms step_avg:5726.19ms
+step:145/800 train_loss:5.3632 train_time:770151ms step_avg:5704.82ms
+step:146/800 train_loss:5.2410 train_time:773079ms step_avg:5684.41ms
+step:147/800 train_loss:5.2630 train_time:775985ms step_avg:5664.12ms
+step:148/800 train_loss:5.3272 train_time:778908ms step_avg:5644.26ms
+step:149/800 train_loss:5.3996 train_time:781830ms step_avg:5624.68ms
+step:150/800 train_loss:5.4530 train_time:784747ms step_avg:5605.34ms
+step:151/800 train_loss:5.2042 train_time:787657ms step_avg:5586.22ms
+step:152/800 train_loss:5.1585 train_time:790566ms step_avg:5567.37ms
+step:153/800 train_loss:5.0283 train_time:793480ms step_avg:5548.81ms
+step:154/800 train_loss:5.2694 train_time:796520ms step_avg:5531.39ms
+step:155/800 train_loss:5.3182 train_time:801295ms step_avg:5526.17ms
+step:156/800 train_loss:5.2894 train_time:806116ms step_avg:5521.34ms
+step:157/800 train_loss:5.2323 train_time:811095ms step_avg:5517.65ms
+step:158/800 train_loss:5.1126 train_time:816121ms step_avg:5514.33ms
+step:159/800 train_loss:5.1113 train_time:821090ms step_avg:5510.67ms
+step:160/800 train_loss:5.1345 train_time:826085ms step_avg:5507.23ms
+step:161/800 train_loss:5.0504 train_time:831036ms step_avg:5503.55ms
+step:162/800 train_loss:5.1161 train_time:835857ms step_avg:5499.06ms
+step:163/800 train_loss:5.0466 train_time:840000ms step_avg:5490.20ms
+step:164/800 train_loss:5.0177 train_time:843738ms step_avg:5478.82ms
+step:165/800 train_loss:4.9676 train_time:849808ms step_avg:5482.63ms
+step:166/800 train_loss:5.2004 train_time:855878ms step_avg:5486.40ms
+step:167/800 train_loss:4.9098 train_time:861927ms step_avg:5489.98ms
+step:168/800 train_loss:4.9878 train_time:867990ms step_avg:5493.61ms
+step:169/800 train_loss:5.0704 train_time:874055ms step_avg:5497.20ms
+step:170/800 train_loss:5.0636 train_time:880120ms step_avg:5500.75ms
+step:171/800 train_loss:5.0548 train_time:886199ms step_avg:5504.34ms
+step:172/800 train_loss:5.3035 train_time:892275ms step_avg:5507.87ms
+step:173/800 train_loss:4.9733 train_time:898331ms step_avg:5511.23ms
+step:174/800 train_loss:5.0979 train_time:904403ms step_avg:5514.65ms
+step:175/800 train_loss:5.2549 train_time:910461ms step_avg:5517.94ms
+step:176/800 train_loss:5.0740 train_time:916542ms step_avg:5521.34ms
+step:177/800 train_loss:5.1034 train_time:922621ms step_avg:5524.68ms
