@@ -34,6 +34,15 @@ fi
 for i in $(seq 0 $((COUNT-1))); do
   SEED=$((BASE_SEED + i))
   echo "==> Baseline run $((i+1))/$COUNT (seed=${SEED}, nproc=${NPROC})"
+  if ! compgen -G "data/fineweb10B/fineweb_train_*.bin" > /dev/null; then
+    echo "Error: no train shards found at data/fineweb10B/fineweb_train_*.bin." >&2
+    echo "Ensure your data is in /workspace/fineweb10B and that data/fineweb10B -> /workspace/fineweb10B symlink exists." >&2
+    exit 1
+  fi
+  if ! compgen -G "data/fineweb10B/fineweb_val_*.bin" > /dev/null; then
+    echo "Error: no val shards found at data/fineweb10B/fineweb_val_*.bin." >&2
+    exit 1
+  fi
   ATTNGATE=none GATEPOS=sdpa GATEACT=sigmoid \
   SEED="${SEED}" \
   torchrun --standalone --nproc_per_node="${NPROC}" "${SCRIPT}"

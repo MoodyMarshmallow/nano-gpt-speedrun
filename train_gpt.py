@@ -399,6 +399,8 @@ def apply_env_overrides():
     args.attn_gate = os.environ.get("ATTNGATE", args.attn_gate)
     args.gate_pos = os.environ.get("GATEPOS", args.gate_pos)
     args.gate_act = os.environ.get("GATEACT", args.gate_act)
+    args.num_iterations = int(os.environ.get("NUM_ITER", args.num_iterations))
+    args.val_loss_every = int(os.environ.get("VAL_EVERY", args.val_loss_every))
 
 def get_git_commit():
     try:

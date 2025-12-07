@@ -32,8 +32,10 @@ You need GPT-2–tokenized FineWeb shards with the header magic `20240520`.
 ### Option A: Download cached shards (fast, recommended)
 ```bash
 # From repo root (/workspace/ese-3060-project)
-python cached_fineweb10B.py 9          # download first 900M training tokens, as specified in the original repo.
-# Place where the loader expects them (symlink into repo)
+python cached_fineweb10B.py 9          # downloads into /workspace/ese-3060-project/fineweb10B by default
+
+# Move once to the persistent volume, then re-link
+mv /workspace/ese-3060-project/fineweb10B /workspace/fineweb10B
 mkdir -p data
 ln -s /workspace/fineweb10B data/fineweb10B   # creates data/fineweb10B -> /workspace/fineweb10B
 ```
@@ -51,6 +53,12 @@ Notes:
   ln -s /workspace/fineweb10B data/fineweb10B
   ```
 - Each bin must contain enough tokens for your batch/seq/num_gpus (header checked at load).
+
+Quick verification before running:
+```bash
+ls data/fineweb10B/fineweb_train_*.bin | head
+ls data/fineweb10B/fineweb_val_*.bin   | head
+```
 
 ## 5) Optional: set baseline env vars
 ```bash
