@@ -386,6 +386,8 @@ class Hyperparameters:
     attn_gate : str = "none" # none|headwise|elementwise|const
     gate_pos : str = "sdpa" # sdpa|value
     gate_act : str = "sigmoid" # sigmoid|ns_sigmoid
+    early_stop_patience : int = 0 # 0 disables early stopping
+    early_stop_min_delta : float = 0.0
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
@@ -398,6 +400,8 @@ def apply_env_overrides():
     args.seed = int(os.environ.get("SEED", args.seed))
     args.warmup_iters = int(os.environ.get("WARMUP_ITERS", args.warmup_iters))
     args.num_iterations = int(os.environ.get("NUM_ITERATIONS", args.num_iterations))
+    args.early_stop_patience = int(os.environ.get("EARLY_STOP_PATIENCE", args.early_stop_patience))
+    args.early_stop_min_delta = float(os.environ.get("EARLY_STOP_MIN_DELTA", args.early_stop_min_delta))
     args.attn_gate = os.environ.get("ATTNGATE", args.attn_gate)
     args.gate_pos = os.environ.get("GATEPOS", args.gate_pos)
     args.gate_act = os.environ.get("GATEACT", args.gate_act)
@@ -512,6 +516,8 @@ if master_process:
 training_time_ms = 0
 best_val_loss = float("inf")
 final_val_loss = None
+no_improve_count = 0
+early_stop_reason = None
 # start the clock
 torch.cuda.synchronize()
 t0 = time.time()
@@ -544,14 +550,25 @@ for step in range(args.num_iterations + 1):
                 del loss
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
-        val_loss_item = val_loss.item()
-        final_val_loss = val_loss_item
-        best_val_loss = min(best_val_loss, val_loss_item)
+        if not torch.isfinite(val_loss):
+            early_stop_reason = "non-finite val_loss"
+            final_val_loss = float("nan")
+            val_loss_item = float("nan")
+        else:
+            val_loss_item = val_loss.item()
+            final_val_loss = val_loss_item
+            if val_loss_item < best_val_loss - args.early_stop_min_delta:
+                best_val_loss = val_loss_item
+                no_improve_count = 0
+            else:
+                no_improve_count += 1
         # log val loss to console and to logfile
         if master_process:
             print(f'step:{step}/{args.num_iterations} val_loss:{val_loss_item:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
             with open(logfile, "a") as f:
                 f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss_item:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
+            if early_stop_reason is None and args.early_stop_patience > 0 and no_improve_count >= args.early_stop_patience:
+                early_stop_reason = f"early_stop patience={args.early_stop_patience} min_delta={args.early_stop_min_delta}"
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
@@ -608,8 +625,12 @@ for step in range(args.num_iterations + 1):
         print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
         with open(logfile, "a") as f:
             f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
+    if early_stop_reason is not None:
+        break
 
 if master_process:
+    if early_stop_reason is not None:
+        print(f"stopped early: {early_stop_reason}")
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
     timed_steps_final = max(args.num_iterations - 9, 1)
     ms_per_step = training_time_ms / timed_steps_final
