@@ -6,3 +6,4 @@ kernels
 jupyterlab
 pandas
 matplotlib
+plotly

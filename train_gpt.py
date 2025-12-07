@@ -396,6 +396,8 @@ def apply_env_overrides():
     # environment-variable overrides allow quick sweeps without editing code
     args.learning_rate = float(os.environ.get("LR", args.learning_rate))
     args.seed = int(os.environ.get("SEED", args.seed))
+    args.warmup_iters = int(os.environ.get("WARMUP_ITERS", args.warmup_iters))
+    args.num_iterations = int(os.environ.get("NUM_ITERATIONS", args.num_iterations))
     args.attn_gate = os.environ.get("ATTNGATE", args.attn_gate)
     args.gate_pos = os.environ.get("GATEPOS", args.gate_pos)
     args.gate_act = os.environ.get("GATEACT", args.gate_act)
