@@ -400,6 +400,7 @@ def apply_env_overrides():
     args.seed = int(os.environ.get("SEED", args.seed))
     args.warmup_iters = int(os.environ.get("WARMUP_ITERS", args.warmup_iters))
     args.num_iterations = int(os.environ.get("NUM_ITERATIONS", args.num_iterations))
+    args.warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", args.warmdown_iters))
     args.early_stop_patience = int(os.environ.get("EARLY_STOP_PATIENCE", args.early_stop_patience))
     args.early_stop_min_delta = float(os.environ.get("EARLY_STOP_MIN_DELTA", args.early_stop_min_delta))
     args.attn_gate = os.environ.get("ATTNGATE", args.attn_gate)
