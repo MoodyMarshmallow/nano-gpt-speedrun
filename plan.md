@@ -280,23 +280,7 @@ Decision rule:
 
 ---
 
-### Stage 3 — Convert “better loss” into “fewer steps”
-
-If you beat baseline loss earlier, cash it in by reducing `num_iterations`.
-
-Procedure (binary-search-ish):
-
-1. Start from baseline steps (5100) 
-2. Try **-10% steps**, check if final val loss still meets your target (class may have its own; speedrun target is ≤3.28). ([GitHub][1])
-3. Continue until you find the smallest reliable step count.
-
-Reliability:
-
-* Do **at least 3 seeds** at the final proposed step count.
-
----
-
-### Stage 4 — Full-length confirmation + stats (what you’ll report)
+### Stage 3 — Full-length confirmation + stats (what you’ll report)
 
 For the best config:
 
