@@ -51,7 +51,7 @@ Example baseline (no gate) short run:
 ATTNGATE=none NUM_ITERATIONS=1500 torchrun --standalone --nproc_per_node=8 train_gpt.py
 ```
 
-## Experiment Summary (from `ESE_3060_Final_Project (1).pdf`)
+## Experiment Summary
 All runs use the provided data pipeline; no data-order changes; torch.compile enabled.
 
 ### Stage 1 (1500 iters @ LR=0.0036, 2 seeds)
@@ -109,8 +109,3 @@ All runs use the provided data pipeline; no data-order changes; torch.compile en
 - Results: `experiments/results.csv` and stage splits (`results_stage1.csv`, `results_stage2.csv`, `results_stage2_5.csv`, etc.).
 - Curves: `experiments/log_curves_*.csv`.
 - Logs: `logs/<run_id>.txt` (includes git hash, args, nvidia-smi, val/train traces).
-
-## Constraints & Notes
-- Do not change data ordering or add extra torch.compile flags beyond the baseline settings.
-- Muon optimizer expects only 2D params in `transformer.h`; gating layers are bias-free/2D to stay Muon-safe.
-- torch.compile adds ~5–10 minutes on first run (CPU-side graph build) while GPU memory is already allocated.
