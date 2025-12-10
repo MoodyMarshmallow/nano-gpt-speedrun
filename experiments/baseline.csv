@@ -1,0 +1,2 @@
+run_id,seed,learning_rate,num_iterations,warmdown_iters,final_val_loss,best_val_loss,train_time_ms,ms_per_step,attn_gate
+475d68c0-dc6e-4bfa-97ed-f62ebf38fca8,1337,0.0036,5100,1450,3.2938,3.2938,1476879,290.15,none
