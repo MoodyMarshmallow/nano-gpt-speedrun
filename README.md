@@ -1,5 +1,5 @@
-# ESE 3060 Final Project Part 2
-NanoGPT speedrun project for ESE 3060: exploring gated attention as an architectural tweak on top of a modded-nanogpt speedrun baseline.
+# Nano GPT Speedrun
+NanoGPT speedrun project for ESE 3060: exploring gated attention as an architectural tweak on top of a modded-nanogpt speedrun baseline from [this record](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/track_1_short/2024-10-14_ModernArch/dabaaddd-237c-4ec9-939d-6608a9ed5e27.txt).
 We implement SDPA-output sigmoid gating inspired by [Gated Attention for Large Language Models](https://arxiv.org/pdf/2505.06708).
 
 ## Quick Start — Best Current Run
